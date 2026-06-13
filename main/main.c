@@ -756,6 +756,7 @@ void app_main() {
 
     db_timer_start_mavlink_heartbeat();
     db_timer_start_mavlink_radio_status();
+    db_timer_start_mavlink_fleet_list();
     db_timer_start_status_led();
 
     if (DB_PARAM_RADIO_MODE != DB_WIFI_MODE_ESPNOW_AIR && DB_PARAM_RADIO_MODE != DB_WIFI_MODE_ESPNOW_GND &&

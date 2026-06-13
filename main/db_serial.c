@@ -37,6 +37,7 @@
 #include "db_protocol.h"
 #include "msp_ltm_serial.h"
 #include "globals.h"
+#include "db_esp_now.h"
 #include "driver/uart.h"
 #include <db_parameters.h>
 
@@ -268,10 +269,38 @@ void db_parse_mavlink_from_radio(int *tcp_clients, udp_conn_list_t *udp_conns, u
     for (int i = 0; i < bytes_read; ++i) {
         fmav_result_t result = {0};
         if (fmav_parse_and_check_to_frame_buf(&result, mav_parser_rx_buf, &fmav_status_radio, buffer[i])) {
-            // Parser detected a full message, write to serial
-            write_to_serial(mav_parser_rx_buf, result.frame_len);
-            // Decode message and react to it if it was for us
+            // Decode the frame first so we can both react to it and detect DroneBridge
+            // fleet-management control frames (MAVLink TUNNEL with a DB payload_type),
+            // which must be consumed here and never forwarded verbatim to the FC.
             fmav_frame_buf_to_msg(&msg, &result, mav_parser_rx_buf);
+            bool db_control_frame = false;
+            if (result.res == FASTMAVLINK_PARSE_RESULT_OK && msg.msgid == FASTMAVLINK_MSG_ID_TUNNEL) {
+                uint16_t db_tunnel_type = fmav_msg_tunnel_get_field_payload_type(&msg);
+                if (db_tunnel_type == DB_ESPNOW_TUNNEL_ADDRESSED_DATA) {
+                    db_control_frame = true;
+                    // payload = [dest_mac(6)][inner MAVLink frame...]. Copy into a zero-filled
+                    // struct so MAVLink v2 trailing-zero truncation is restored correctly.
+                    fmav_tunnel_t db_tunnel;
+                    memset(&db_tunnel, 0, sizeof(db_tunnel));
+                    uint16_t db_copy_len = (msg.len < (uint16_t) sizeof(db_tunnel)) ? msg.len : (uint16_t) sizeof(db_tunnel);
+                    memcpy(&db_tunnel, msg.payload, db_copy_len);
+                    if (db_tunnel.payload_length > ESP_NOW_ETH_ALEN &&
+                        memcmp(db_tunnel.payload, LOCAL_MAC_ADDRESS, ESP_NOW_ETH_ALEN) == 0) {
+                        // Addressed to this AIR unit -> deliver the inner frame to our flight controller
+                        write_to_serial(&db_tunnel.payload[ESP_NOW_ETH_ALEN],
+                                        db_tunnel.payload_length - ESP_NOW_ETH_ALEN);
+                    } else {
+                        // addressed to a different drone -> ignore
+                    }
+                } else if (db_tunnel_type == DB_ESPNOW_TUNNEL_FLEET_LIST) {
+                    db_control_frame = true; // GND->GCS only; never hand it to an FC
+                }
+            }
+            if (!db_control_frame) {
+                // Normal traffic: forward the complete frame to the serial interface (FC or GCS)
+                write_to_serial(mav_parser_rx_buf, result.frame_len);
+            }
+            // React to the message if it was addressed to this ESP32 itself
             if (result.res == FASTMAVLINK_PARSE_RESULT_OK) {
                 db_status_led_mark_radio_rx();
                 if (fmav_msg_is_for_me(db_get_mav_sys_id(), db_get_mav_comp_id(), &msg)) {
