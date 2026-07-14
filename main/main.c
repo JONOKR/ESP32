@@ -473,6 +473,14 @@ void db_init_wifi_espnow() {
     ESP_ERROR_CHECK(esp_wifi_start());
     ESP_ERROR_CHECK(esp_wifi_set_channel(DB_PARAM_CHANNEL, WIFI_SECOND_CHAN_NONE));
     ESP_ERROR_CHECK(esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_LR));
+    // Explicitly request maximum TX power (units of 0.25 dBm -> 80 = 20 dBm, the
+    // EU 2.4 GHz EIRP limit and this build's CONFIG_ESP_PHY_MAX_WIFI_TX_POWER).
+    // The driver clamps to the PHY calibration limit; being explicit protects
+    // range against a lower sdkconfig default or an IDF default change.
+    esp_err_t tx_pwr_err = esp_wifi_set_max_tx_power(80);
+    if (tx_pwr_err != ESP_OK) {
+        ESP_LOGW(TAG, "esp_wifi_set_max_tx_power(80) failed: %s", esp_err_to_name(tx_pwr_err));
+    }
     ESP_LOGI(TAG, "Enabled ESP-NOW WiFi Mode! LR Mode is set. This device will be invisible to non-ESP32 devices!");
     ESP_ERROR_CHECK(esp_read_mac(LOCAL_MAC_ADDRESS, ESP_MAC_WIFI_STA));
 }

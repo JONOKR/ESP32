@@ -4,7 +4,12 @@
 #   .\flash-fw.ps1 -Chip esp32c3                 # auto-detects the COM port if exactly one
 #   .\flash-fw.ps1 -Chip esp32c3 -Port COM4      # or specify it
 #   .\flash-fw.ps1 -Chip esp32c6 -Serial usb -Port COM16   # flash the USB/JTAG (GND-over-USB) image
+#   .\flash-fw.ps1 -Chip esp32c3 -Role air -Port COM7      # provision a role-baked JONOKR unit
 #   .\flash-fw.ps1 -Chip esp32c6 -Port COM7 -Erase   # also wipe saved config/NVS (factory reset)
+#
+# -Role air|gnd|beacon flashes the role image from build\<chip>-<role>\ (build with
+# build-fw.ps1 -Role ...) and ALWAYS erases first: the role's boot defaults only take
+# effect on a clean NVS — that's the whole point of provisioning.
 #
 # Requires on host:  pip install "esptool<5"
 # (No-Python option: use the browser flasher .\webflasher.ps1 instead - nothing to install.)
@@ -13,20 +18,25 @@
 param(
     [Parameter(Mandatory)][ValidateSet('esp32c3', 'esp32c6', 'esp32s3')][string]$Chip,
     [ValidateSet('uart', 'usb')][string]$Serial = 'uart',
+    [ValidateSet('air', 'gnd', 'beacon')][string]$Role,
     [string]$Port,
     [int]$Baud = 460800,
     [switch]$Erase
 )
 
+if ($Role) { $Erase = $true }   # role provisioning requires factory-fresh NVS
+
 function Fail($msg) { Write-Host "ERROR: $msg" -ForegroundColor Red; exit 1 }
 
 $repo     = $PSScriptRoot
-# USB/JTAG-serial images live in build\<chip>-usb\ (see build-fw.ps1 -Serial usb).
-$variant  = if ($Serial -eq 'usb') { "$Chip-usb" } else { $Chip }
+# Role images live in build\<chip>-<role>\, USB/JTAG-serial images in build\<chip>-usb\.
+$variant  = if ($Role) { "$Chip-$Role" } elseif ($Serial -eq 'usb') { "$Chip-usb" } else { $Chip }
 $buildDir = Join-Path $repo "build\$variant"
 if (-not (Test-Path (Join-Path $buildDir 'flash_args'))) {
-    $hint = if ($Serial -eq 'usb') { ".\build-fw.ps1 -Chips $Chip -Serial usb" } else { ".\build-fw.ps1 -Chips $Chip" }
-    Fail "No $Serial build for $Chip at $buildDir. Run:  $hint"
+    $hint = if ($Role) { ".\build-fw.ps1 -Chips $Chip -Role $Role" }
+            elseif ($Serial -eq 'usb') { ".\build-fw.ps1 -Chips $Chip -Serial usb" }
+            else { ".\build-fw.ps1 -Chips $Chip" }
+    Fail "No build at $buildDir. Run:  $hint"
 }
 
 # esptool available on the host?
@@ -65,4 +75,13 @@ if ($code -ne 0) {
     Write-Host "  hold BOOT (IO0), tap/replug RST, keep holding BOOT a moment, then re-run." -ForegroundColor Red
     exit 1
 }
-Write-Host "`n==> [$Chip] flashed on $Port. Connect to WiFi 'DroneBridge ESP32' (pwd: dronebridge) -> http://192.168.2.1/" -ForegroundColor Green
+if ($Role) {
+    $roleMsg = switch ($Role) {
+        'air'    { "AIR unit ready - wire the UART to the flight controller; it joins the ESP-NOW net automatically." }
+        'gnd'    { "GND unit ready - plug it into the GCS computer over USB-C; it appears as a COM port." }
+        'beacon' { "Beacon ready - wire the UART to the u-blox GPS (115200); position streams to the GCS automatically." }
+    }
+    Write-Host "`n==> [$Chip/$Role] flashed on $Port. $roleMsg" -ForegroundColor Green
+} else {
+    Write-Host "`n==> [$Chip] flashed on $Port. Connect to WiFi 'DroneBridge ESP32' (pwd: dronebridge) -> http://192.168.2.1/" -ForegroundColor Green
+}

@@ -11,6 +11,7 @@ set(SRCS
         db_parameters.c
         db_led_indicator.c
         db_timers.c
+        db_gps_beacon.c
 )
 
 if(CONFIG_BT_ENABLED)
@@ -19,6 +20,28 @@ endif()
 
 idf_component_register(SRCS ${SRCS}
         INCLUDE_DIRS ".")
+
+# Role-baked provisioning (JONOKR): `idf.py -DDB_ROLE=AIR|GND|BEACON build`
+# bakes that role's boot defaults into the image (see db_parameters.h), so the
+# flasher GUI produces units that need zero web-UI configuration. The values
+# are passed as the enum SYMBOLS, evaluated in C where the enums are defined.
+if(DEFINED DB_ROLE)
+    if(DB_ROLE STREQUAL "AIR")
+        target_compile_definitions(${COMPONENT_LIB} PRIVATE
+                "DB_BUILD_DEFAULT_RADIO_MODE=DB_WIFI_MODE_ESPNOW_AIR")
+    elseif(DB_ROLE STREQUAL "GND")
+        target_compile_definitions(${COMPONENT_LIB} PRIVATE
+                "DB_BUILD_DEFAULT_RADIO_MODE=DB_WIFI_MODE_ESPNOW_GND")
+    elseif(DB_ROLE STREQUAL "BEACON")
+        target_compile_definitions(${COMPONENT_LIB} PRIVATE
+                "DB_BUILD_DEFAULT_RADIO_MODE=DB_WIFI_MODE_ESPNOW_AIR"
+                "DB_BUILD_DEFAULT_SERIAL_PROTO=DB_SERIAL_PROTOCOL_UBX_BEACON"
+                "DB_BUILD_DEFAULT_BAUD=115200")
+    else()
+        message(FATAL_ERROR "Unknown DB_ROLE '${DB_ROLE}' (use AIR, GND or BEACON)")
+    endif()
+    message(STATUS "DroneBridge JONOKR role-baked build: ${DB_ROLE}")
+endif()
 
 
 if(CONFIG_WEB_DEPLOY_SF)

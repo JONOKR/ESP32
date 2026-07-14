@@ -1,14 +1,26 @@
 #!/usr/bin/env python3
 """
-flash-gui.py - Visual build/flash tool for DroneBridge JONOKR (ESP32-C3/C6/S3).
+flash-gui.py - One-click provisioning tool for DroneBridge JONOKR units.
 
-A thin Tkinter front-end over the audited build-fw.ps1 / flash-fw.ps1 scripts:
-  * Build  -> runs build-fw.ps1  (Docker-isolated ESP-IDF build)
-  * Flash  -> runs flash-fw.ps1  (host esptool over USB)
+Pick the UNIT TYPE (air / ground / beacon), plug the board in, click
+"Flash & configure". The tool then:
+  1. auto-detects the ESP32 chip on the selected COM port (esptool),
+  2. builds the role-baked firmware image if it isn't built yet
+     (build-fw.ps1 -Role ... -> Docker-isolated ESP-IDF build),
+  3. erases the flash and writes the image (flash-fw.ps1 -Role ...).
 
-Pure Python standard library (tkinter) + pyserial (already installed with esptool)
-for COM-port listing. No new binaries are introduced - all real work happens in the
-reviewed PowerShell scripts.
+The role image boots straight into its job with ZERO further configuration
+(no web UI): the role's boot defaults are baked into the firmware and the
+erase guarantees they take effect.
+
+  air    - ESP-NOW AIR unit: UART wired to the flight controller.
+  ground - ESP-NOW GND station: plugs into the GCS computer over USB-C.
+  beacon - GPS beacon/armband: UART wired to a u-blox GPS (115200 baud);
+           streams its position to the GCS automatically.
+
+Pure Python standard library (tkinter) + pyserial (installed with esptool)
+for COM-port listing. All real work happens in the reviewed PowerShell
+scripts + esptool.
 
 Launch:  python flash-gui.py     (or double-click Flasher.cmd)
 """
@@ -24,10 +36,17 @@ from tkinter.scrolledtext import ScrolledText
 REPO = os.path.dirname(os.path.abspath(__file__))
 BUILD_PS1 = os.path.join(REPO, "build-fw.ps1")
 FLASH_PS1 = os.path.join(REPO, "flash-fw.ps1")
-CHIPS = ("esp32c3", "esp32c6", "esp32s3")
-SERIALS = ("uart", "usb")  # data interface: uart = GPIO UART (AIR -> flight controller); usb = USB/JTAG (GND over USB-C)
+
+# GUI label -> (script role value, one-line description)
+ROLES = {
+    "air":    ("air",    "wired to the flight controller (UART) — joins the ESP-NOW net"),
+    "ground": ("gnd",    "plugs into the GCS computer over USB-C — appears as a COM port"),
+    "beacon": ("beacon", "u-blox GPS on the UART (115200) — streams its position to the GCS"),
+}
+SUPPORTED_CHIPS = ("esp32c3", "esp32c6", "esp32s3")
 PCT_RE = re.compile(r"\((\d+)\s*%\)")
-NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)  # hide the child PowerShell console
+CHIP_RE = re.compile(r"(?:Detecting chip type\.+|Chip is)\s+(ESP32[-A-Za-z0-9]*)")
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)  # hide child consoles
 
 
 def list_serial_ports():
@@ -65,46 +84,41 @@ class FlasherApp:
         self.proc = None
         self.q = queue.Queue()
         self.running = False
+        self.stop_requested = False
 
         root.title("DroneBridge JONOKR Flasher")
-        root.minsize(660, 480)
+        root.minsize(680, 480)
 
         top = ttk.Frame(root, padding=8)
         top.pack(fill="x")
-        ttk.Label(top, text="Chip:").grid(row=0, column=0, sticky="w")
-        self.chip = ttk.Combobox(top, values=CHIPS, state="readonly", width=10)
-        self.chip.set(CHIPS[0])
-        self.chip.grid(row=0, column=1, padx=(4, 16))
+        ttk.Label(top, text="Unit type:").grid(row=0, column=0, sticky="w")
+        self.role = ttk.Combobox(top, values=list(ROLES), state="readonly", width=10)
+        self.role.set("air")
+        self.role.grid(row=0, column=1, padx=(4, 16))
+        self.role.bind("<<ComboboxSelected>>", lambda _e: self._show_role_hint())
         ttk.Label(top, text="Port:").grid(row=0, column=2, sticky="w")
         self.port = ttk.Combobox(top, state="readonly", width=14)
         self.port.grid(row=0, column=3, padx=4)
         self.refresh_btn = ttk.Button(top, text="Refresh", width=8, command=self.refresh_ports)
         self.refresh_btn.grid(row=0, column=4, padx=4)
-        self.erase = tk.BooleanVar(value=False)
-        self.erase_chk = ttk.Checkbutton(top, text="Erase first (factory wipe)", variable=self.erase)
-        self.erase_chk.grid(row=0, column=5, padx=(16, 0))
 
-        ttk.Label(top, text="Serial:").grid(row=1, column=0, sticky="w", pady=(6, 0))
-        self.serial = ttk.Combobox(top, values=SERIALS, state="readonly", width=10)
-        self.serial.set(SERIALS[0])
-        self.serial.grid(row=1, column=1, padx=(4, 16), pady=(6, 0), sticky="w")
-        ttk.Label(top, text="usb = GND plugged into the GCS over USB-C   |   uart = AIR wired to a flight controller"
-                  ).grid(row=1, column=2, columnspan=4, sticky="w", pady=(6, 0))
+        self.role_hint = ttk.Label(top, text="", foreground="#666666")
+        self.role_hint.grid(row=1, column=0, columnspan=5, sticky="w", pady=(6, 0))
 
-        btns = ttk.Frame(root, padding=(8, 0))
+        btns = ttk.Frame(root, padding=(8, 4))
         btns.pack(fill="x")
-        self.build_btn = ttk.Button(btns, text="Build", command=self.do_build)
-        self.build_btn.pack(side="left", padx=4, ipadx=12, ipady=3)
-        self.flash_btn = ttk.Button(btns, text="Flash", command=self.do_flash)
-        self.flash_btn.pack(side="left", padx=4, ipadx=12, ipady=3)
+        self.flash_btn = ttk.Button(btns, text="Flash && configure", command=self.do_flash)
+        self.flash_btn.pack(side="left", padx=4, ipadx=14, ipady=4)
+        self.build_btn = ttk.Button(btns, text="Rebuild firmware", command=self.do_rebuild)
+        self.build_btn.pack(side="left", padx=4, ipadx=8, ipady=4)
         self.stop_btn = ttk.Button(btns, text="Stop", command=self.stop, state="disabled")
-        self.stop_btn.pack(side="left", padx=4, ipadx=6, ipady=3)
+        self.stop_btn.pack(side="left", padx=4, ipadx=6, ipady=4)
 
         prog = ttk.Frame(root, padding=8)
         prog.pack(fill="x")
         self.bar = ttk.Progressbar(prog, mode="indeterminate")
         self.bar.pack(side="left", fill="x", expand=True)
-        self.status = ttk.Label(prog, text="Ready", width=26, anchor="w")
+        self.status = ttk.Label(prog, text="Ready", width=30, anchor="w")
         self.status.pack(side="left", padx=(8, 0))
 
         self.log = ScrolledText(root, height=18, bg="#111111", fg="#dddddd",
@@ -112,10 +126,13 @@ class FlasherApp:
         self.log.pack(fill="both", expand=True, padx=8, pady=(0, 8))
         self.log.configure(state="disabled")
 
-        self.append("DroneBridge JONOKR visual flasher\n"
+        self.append("DroneBridge JONOKR provisioning flasher\n"
                     f"Repo: {REPO}\n"
-                    "Build runs in Docker; Flash uses host esptool. Both wrap the .ps1 scripts.\n")
+                    "Pick the unit type, plug the board in, click 'Flash & configure'.\n"
+                    "Chip type is auto-detected; the flash is always erased so the role\n"
+                    "defaults take effect — the unit needs no further configuration.\n")
         self._check_scripts()
+        self._show_role_hint()
         self.refresh_ports()
         self.root.after(80, self._drain)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -124,10 +141,13 @@ class FlasherApp:
     def _check_scripts(self):
         missing = [os.path.basename(p) for p in (BUILD_PS1, FLASH_PS1) if not os.path.isfile(p)]
         if missing:
-            self.append("ERROR: missing " + ", ".join(missing) +
-                        f" - run this from the repo folder.\n")
+            self.append("ERROR: missing " + ", ".join(missing) + " - run this from the repo folder.\n")
             self.build_btn.config(state="disabled")
             self.flash_btn.config(state="disabled")
+
+    def _show_role_hint(self):
+        _script_role, hint = ROLES[self.role.get()]
+        self.role_hint.config(text=f"{self.role.get()}: {hint}")
 
     def refresh_ports(self):
         ports = list_serial_ports()
@@ -146,9 +166,9 @@ class FlasherApp:
 
     def set_busy(self, busy, status):
         self.running = busy
-        for w in (self.build_btn, self.flash_btn, self.refresh_btn, self.erase_chk):
+        for w in (self.build_btn, self.flash_btn, self.refresh_btn):
             w.config(state="disabled" if busy else "normal")
-        for combo in (self.chip, self.serial, self.port):
+        for combo in (self.role, self.port):
             combo.config(state="disabled" if busy else "readonly")
         self.stop_btn.config(state="normal" if busy else "disabled")
         self.status.config(text=status)
@@ -157,16 +177,31 @@ class FlasherApp:
         else:
             self.bar.stop()
 
-    # ---------- run a powershell script ----------
-    def run_script(self, args, label):
+    def _selected_port(self):
+        sel = self.port.get().strip()
+        return sel.split()[0] if sel else ""   # COMx token, drop the description
+
+    # ---------- worker plumbing ----------
+    def _start_job(self, label, job):
         if self.running:
             return
+        self.stop_requested = False
         self.set_busy(True, label + " ...")
-        self.append(f"\n===== {label} =====\n> {os.path.basename(args[0])} {' '.join(args[1:])}\n")
-        cmd = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File"] + args
-        threading.Thread(target=self._worker, args=(cmd, label), daemon=True).start()
+        self.append(f"\n===== {label} =====\n")
+        threading.Thread(target=self._job_wrapper, args=(label, job), daemon=True).start()
 
-    def _worker(self, cmd, label):
+    def _job_wrapper(self, label, job):
+        try:
+            ok = job()
+        except Exception as e:
+            self.q.put(("line", f"unexpected error: {e}\n"))
+            ok = False
+        self.q.put(("done", (label, 0 if ok else 1)))
+
+    def _run_stream(self, label, cmd):
+        """Run a command streaming output to the log. Returns True on exit 0."""
+        self.q.put(("line", "> " + " ".join(os.path.basename(str(c)) for c in cmd[:2])
+                    + " " + " ".join(str(c) for c in cmd[2:]) + "\n"))
         try:
             self.proc = subprocess.Popen(
                 cmd, cwd=REPO, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -174,8 +209,7 @@ class FlasherApp:
                 creationflags=NO_WINDOW)
         except Exception as e:
             self.q.put(("line", f"failed to start: {e}\n"))
-            self.q.put(("done", (label, 1)))
-            return
+            return False
         for line in self.proc.stdout:
             self.q.put(("line", line))
             m = PCT_RE.search(line)
@@ -183,7 +217,87 @@ class FlasherApp:
                 self.q.put(("status", f"{label} ... {m.group(1)}%"))
         code = self.proc.wait()
         self.proc = None
-        self.q.put(("done", (label, code)))
+        return code == 0 and not self.stop_requested
+
+    def _run_ps1(self, label, script, args):
+        return self._run_stream(label, ["powershell.exe", "-NoProfile", "-ExecutionPolicy",
+                                        "Bypass", "-File", script] + args)
+
+    def _detect_chip(self, port):
+        """Ask esptool which chip is on the port. Returns 'esp32c3' etc. or None."""
+        self.q.put(("status", "Detecting chip ..."))
+        self.q.put(("line", f"[detect] querying {port} ...\n"))
+        try:
+            out = subprocess.run(
+                ["python", "-m", "esptool", "--port", port, "chip_id"],
+                cwd=REPO, capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=30, creationflags=NO_WINDOW,
+            ).stdout
+        except FileNotFoundError:
+            self.q.put(("line", "python/esptool not found - install Python 3 and:  pip install \"esptool<5\"\n"))
+            return None
+        except subprocess.TimeoutExpired:
+            self.q.put(("line", "chip detection timed out - hold BOOT/IO0, tap RST, try again\n"))
+            return None
+        m = CHIP_RE.search(out or "")
+        if not m:
+            tail = "\n".join((out or "").splitlines()[-4:])
+            self.q.put(("line", f"could not detect the chip:\n{tail}\n"))
+            return None
+        chip = m.group(1).lower().replace("-", "")
+        if chip not in SUPPORTED_CHIPS:
+            self.q.put(("line", f"unsupported chip '{m.group(1)}' (supported: {', '.join(SUPPORTED_CHIPS)})\n"))
+            return None
+        self.q.put(("line", f"[detect] {m.group(1)}\n"))
+        return chip
+
+    def _build_exists(self, chip, script_role):
+        return os.path.isfile(os.path.join(REPO, "build", f"{chip}-{script_role}", "flash_args"))
+
+    # ---------- button actions ----------
+    def do_flash(self):
+        role_label = self.role.get()
+        script_role, _hint = ROLES[role_label]
+        port = self._selected_port()
+        if not port:
+            self.append("no COM port selected - plug the unit in and hit Refresh\n")
+            return
+
+        def job():
+            chip = self._detect_chip(port)
+            if chip is None or self.stop_requested:
+                return False
+            if not self._build_exists(chip, script_role):
+                self.q.put(("line", f"[build] no {role_label} image for {chip} yet - building (first time takes a few minutes) ...\n"))
+                self.q.put(("status", f"Building {chip} {role_label} ..."))
+                if not self._run_ps1(f"Build {chip} ({role_label})", BUILD_PS1,
+                                     ["-Chips", chip, "-Role", script_role]):
+                    return False
+            if self.stop_requested:
+                return False
+            self.q.put(("status", f"Flashing {chip} {role_label} ..."))
+            self.q.put(("line", "(erase + write; if it stalls at 'Connecting....', hold BOOT/IO0, tap RST, retry)\n"))
+            return self._run_ps1(f"Flash {chip} ({role_label})", FLASH_PS1,
+                                 ["-Chip", chip, "-Role", script_role, "-Port", port])
+
+        self._start_job(f"Flash & configure — {role_label} unit", job)
+
+    def do_rebuild(self):
+        role_label = self.role.get()
+        script_role, _hint = ROLES[role_label]
+        port = self._selected_port()
+        if not port:
+            self.append("no COM port selected - plug the unit in and hit Refresh\n")
+            return
+
+        def job():
+            chip = self._detect_chip(port)
+            if chip is None or self.stop_requested:
+                return False
+            return self._run_ps1(f"Build {chip} ({role_label})", BUILD_PS1,
+                                 ["-Chips", chip, "-Role", script_role])
+
+        self._start_job(f"Rebuild firmware — {role_label}", job)
 
     def _drain(self):
         try:
@@ -203,26 +317,8 @@ class FlasherApp:
             pass
         self.root.after(80, self._drain)
 
-    # ---------- button actions ----------
-    def do_build(self):
-        chip = self.chip.get()
-        serial = self.serial.get()
-        self.run_script([BUILD_PS1, "-Chips", chip, "-Serial", serial], f"Build {chip} ({serial})")
-
-    def do_flash(self):
-        chip = self.chip.get()
-        serial = self.serial.get()
-        args = [FLASH_PS1, "-Chip", chip, "-Serial", serial]
-        sel = self.port.get().strip()
-        port = sel.split()[0] if sel else ""   # take the COMx token, drop the description
-        if port:
-            args += ["-Port", port]
-        if self.erase.get():
-            args += ["-Erase"]
-        self.append("(tip: if flashing stalls at 'Connecting....', hold BOOT/IO0, tap RST, then Flash again)\n")
-        self.run_script(args, f"Flash {chip} ({serial})")
-
     def stop(self):
+        self.stop_requested = True
         if self.proc:
             self.append("\n[stopping - best effort; a running docker build may keep going]\n")
             try:

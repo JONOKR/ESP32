@@ -42,6 +42,7 @@
 #include <db_parameters.h>
 #include "main.h"
 #include "db_serial.h"
+#include "db_gps_beacon.h"
 #include "db_esp_now.h"
 
 #define TAG "DB_CONTROL"
@@ -476,6 +477,12 @@ void read_process_serial_link(int *tcp_clients, uint *transparent_buff_pos, uint
         case DB_SERIAL_PROTOCOL_MAVLINK:
             db_read_serial_parse_mavlink(tcp_clients, udp_conn_list, msp_message_buffer, transparent_buff_pos);
             break;
+        case DB_SERIAL_PROTOCOL_UBX_BEACON:
+            // Beacon/armband role: the UART carries a u-blox GPS, not an FC.
+            // Parses UBX NAV-PVT and emits a synthesized MAVLink position
+            // stream to the radio (see db_gps_beacon.c).
+            db_gps_beacon_process(tcp_clients, udp_conn_list);
+            break;
         case DB_SERIAL_PROTOCOL_TRANSPARENT:
         default:
             db_read_serial_parse_transparent(tcp_clients, udp_conn_list, serial_buffer, transparent_buff_pos);
@@ -520,6 +527,12 @@ _Noreturn void control_module_esp_now() {
                 // Parse, so we can listen in and react to certain messages - function will send parsed messages to serial link.
                 // We can not write to serial first since we might inject packets and do not know when to do so to not "destroy" an existing packet
                 db_parse_mavlink_from_radio(NULL, NULL, db_espnow_uart_evt.data, db_espnow_uart_evt.data_len);
+            } else if (DB_PARAM_SERIAL_PROTO == DB_SERIAL_PROTOCOL_UBX_BEACON) {
+                // Beacon role: the serial device is a GPS - never forward radio
+                // traffic to it. The beacon handler picks out MAC-addressed
+                // fleet-management tunnels (SYSID_THISMAV assignment, reboot)
+                // and applies them to the unit itself; everything else is dropped.
+                db_gps_beacon_handle_radio(db_espnow_uart_evt.data, db_espnow_uart_evt.data_len);
             } else {
                 // no parsing with any other protocol - transparent here - just pass through
                 write_to_serial(db_espnow_uart_evt.data, db_espnow_uart_evt.data_len);
@@ -694,6 +707,9 @@ _Noreturn void control_module_udp_tcp() {
                         // Parse, so we can listen in and react to certain messages - function will send parsed messages to serial link.
                         // We can not write to serial first since we might inject packets and do not know when to do so to not "destroy" an existign packet
                         db_parse_mavlink_from_radio(connected_tcp_clients, udp_conn_list, tcp_client_buffer, recv_length);
+                    } else if (DB_PARAM_SERIAL_PROTO == DB_SERIAL_PROTOCOL_UBX_BEACON) {
+                        // Beacon role: apply MAC-addressed fleet tunnels; never write to the GPS
+                        db_gps_beacon_handle_radio(tcp_client_buffer, recv_length);
                     } else {
                         // no parsing with any other protocol - transparent here
                         write_to_serial(tcp_client_buffer, recv_length);
@@ -722,6 +738,9 @@ _Noreturn void control_module_udp_tcp() {
                 // Parse, so we can listen in and react to certain messages - function will send parsed messages to serial link.
                 // We can not write to serial first since we might inject packets and do not know when to do so to not "destroy" an existing packet
                 db_parse_mavlink_from_radio(connected_tcp_clients, udp_conn_list, udp_buffer, recv_length);
+            } else if (DB_PARAM_SERIAL_PROTO == DB_SERIAL_PROTOCOL_UBX_BEACON) {
+                // Beacon role: apply MAC-addressed fleet tunnels; never write to the GPS
+                db_gps_beacon_handle_radio(udp_buffer, recv_length);
             } else {
                 // no parsing with any other protocol - transparent here
                 write_to_serial(udp_buffer, recv_length);
@@ -828,6 +847,9 @@ _Noreturn void control_module_ble() {
                 // We cannot write to serial first since we might inject packets and do not know when to do so to not "destroy" an
                 // existing packet
                 db_parse_mavlink_from_radio(NULL, NULL, bleData.data, bleData.data_len);
+            } else if (DB_PARAM_SERIAL_PROTO == DB_SERIAL_PROTOCOL_UBX_BEACON) {
+                // Beacon role: apply MAC-addressed fleet tunnels; never write to the GPS
+                db_gps_beacon_handle_radio(bleData.data, bleData.data_len);
             } else {
                 // no parsing with any other protocol - transparent here - just pass through
                 write_to_serial(bleData.data, bleData.data_len);

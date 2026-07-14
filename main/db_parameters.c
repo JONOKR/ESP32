@@ -64,8 +64,10 @@ db_parameter_t db_param_radio_mode = {
         },
         .value = {
                 .db_param_u8 = {
-                        .value = DB_WIFI_MODE_AP,
-                        .default_value = DB_WIFI_MODE_AP,
+                        // Role-baked default (see db_parameters.h): stock builds
+                        // boot as WiFi AP, JONOKR role images as ESP-NOW AIR/GND.
+                        .value = DB_BUILD_DEFAULT_RADIO_MODE,
+                        .default_value = DB_BUILD_DEFAULT_RADIO_MODE,
                         .min = DB_WIFI_MODE_AP,
                         .max = DB_WIFI_MODE_END,
                 }
@@ -151,8 +153,10 @@ db_parameter_t db_param_baud = {
         },
         .value = {
                 .db_param_i32 = {
-                        .value = DB_DEFAULT_UART_BAUD_RATE,
-                        .default_value = DB_DEFAULT_UART_BAUD_RATE,
+                        // Role-baked default (see db_parameters.h): beacon images
+                        // default to 115200 (MicoAir M10 GPS), others to stock.
+                        .value = DB_BUILD_DEFAULT_BAUD,
+                        .default_value = DB_BUILD_DEFAULT_BAUD,
                         .min = 1200,
                         .max = 5000000,
                 }
@@ -277,10 +281,12 @@ db_parameter_t db_param_proto = {
         },
         .value = {
                 .db_param_u8 = {
-                        .value = DB_SERIAL_PROTOCOL_MAVLINK,
-                        .default_value = DB_SERIAL_PROTOCOL_MAVLINK,
+                        // Role-baked default (see db_parameters.h): beacon images
+                        // boot with the UBX GPS protocol, others with MAVLink.
+                        .value = DB_BUILD_DEFAULT_SERIAL_PROTO,
+                        .default_value = DB_BUILD_DEFAULT_SERIAL_PROTO,
                         .min = DB_SERIAL_PROTOCOL_MSPLTM,
-                        .max = DB_SERIAL_PROTOCOL_TRANSPARENT,
+                        .max = DB_SERIAL_PROTOCOL_UBX_BEACON,
                 }
         }
 };

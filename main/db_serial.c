@@ -350,14 +350,26 @@ void db_parse_mavlink_from_radio(int *tcp_clients, udp_conn_list_t *udp_conns, u
 void db_read_serial_parse_mavlink(int *tcp_clients, udp_conn_list_t *udp_conns, uint8_t *serial_buffer,
                                   unsigned int *serial_buff_pos) {
     static uint8_t mav_parser_rx_buf[296];  // at least 280 bytes which is the max len for a MAVLink v2 packet
-    uint8_t uart_read_buf[DB_PARAM_SERIAL_PACK_SIZE];
+    // Effective pack size for MAVLink framing. Below one full MAVLink v2 frame
+    // (280 bytes incl. signature) the configured trans_pack_size would force
+    // needless frame splitting, so on WiFi links treat it as lower-bounded.
+    // ESP-NOW is excluded on purpose: there the parameter was pinned to the
+    // radio's payload limit (215) at init and raising it here would only
+    // re-introduce splitting at the radio layer. Runtime-only; the persisted
+    // parameter value is untouched.
+    uint16_t pack_size = DB_PARAM_SERIAL_PACK_SIZE;
+    if (DB_PARAM_RADIO_MODE != DB_WIFI_MODE_ESPNOW_AIR && DB_PARAM_RADIO_MODE != DB_WIFI_MODE_ESPNOW_GND &&
+        pack_size < 280) {
+        pack_size = 280;    // fits any complete MAVLink v2 frame
+    }
+    uint8_t uart_read_buf[pack_size];
     // timeout variables
     static TickType_t last_tick = 0;    // time when we received something from the serial interface for the last time
     static TickType_t current_tick = 0;
     current_tick = xTaskGetTickCount(); // get current time
 
     // Read bytes from serial link (UART or USB/JTAG interface)
-    int bytes_read = db_read_serial(uart_read_buf, DB_PARAM_SERIAL_PACK_SIZE);
+    int bytes_read = db_read_serial(uart_read_buf, pack_size);
 
     if (bytes_read == 0) {
         // did not read anything this cycle -> check serial read timeout
@@ -388,20 +400,20 @@ void db_read_serial_parse_mavlink(int *tcp_clients, udp_conn_list_t *udp_conns, 
             ESP_LOGD(TAG, "Parser detected a full message (%lu total): result.frame_len %i", serial_total_decoded_mav_msgs,
                      result.frame_len);
             // Check if the new message will fit in the buffer
-            if (*serial_buff_pos == 0 && result.frame_len > DB_PARAM_SERIAL_PACK_SIZE) {
-                // frame_len is bigger than DB_PARAM_SERIAL_PACK_SIZE -> Split into multiple messages since
+            if (*serial_buff_pos == 0 && result.frame_len > pack_size) {
+                // frame_len is bigger than pack_size -> Split into multiple messages since
                 // e.g. ESP-NOW can only handle DB_ESPNOW_PAYLOAD_MAXSIZE bytes which is less than MAVLink max msg length
                 uint16_t sent_bytes = 0;
                 uint16_t next_chunk_len = 0;
                 do {
                     next_chunk_len = result.frame_len - sent_bytes;
-                    if (next_chunk_len > DB_PARAM_SERIAL_PACK_SIZE) {
-                        next_chunk_len = DB_PARAM_SERIAL_PACK_SIZE;
+                    if (next_chunk_len > pack_size) {
+                        next_chunk_len = pack_size;
                     } else {}
                     db_send_to_all_clients(tcp_clients, udp_conns, &mav_parser_rx_buf[sent_bytes], next_chunk_len);
                     sent_bytes += next_chunk_len;
                 } while (sent_bytes < result.frame_len);
-            } else if (*serial_buff_pos + result.frame_len > DB_PARAM_SERIAL_PACK_SIZE) {
+            } else if (*serial_buff_pos + result.frame_len > pack_size) {
                 // New message won't fit into the buffer, send buffer first
                 db_send_to_all_clients(tcp_clients, udp_conns, serial_buffer, *serial_buff_pos);
                 *serial_buff_pos = 0;

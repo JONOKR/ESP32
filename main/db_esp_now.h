@@ -27,7 +27,11 @@
 #include "freertos/queue.h"
 
 #define DB_ESPNOW_MAX_BROADCAST_PEERS   19 // Number of max. broadcast peers. that we support with internal telemetry. Limit is 255, but this is the max we can fit into one packet 250bytes
-#define ESPNOW_QUEUE_SIZE   6
+// Queue depth for the send / recv-callback / uart-write queues. 12 (up from
+// the original 6) so a telemetry burst or a mission-upload volley rides out a
+// short link fade instead of overflowing and dropping frames (incl. heartbeats).
+// Memory cost is small: 3 queues x 12 slots + <=250 B malloc'd payload each.
+#define ESPNOW_QUEUE_SIZE   12
 #define ESPNOW_MAXDELAY     512
 #define DB_ESPNOW_AES_IV_LEN       12   // 96 bit
 #define DB_ESPNOW_AES_TAG_LEN      16

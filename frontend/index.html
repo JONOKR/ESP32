@@ -243,7 +243,12 @@
                     </select>
                 </div>
             </div>
-            <div id="trans_pack_size_div" class="row">
+            <!-- Hidden (JONOKR): the firmware now picks the packet size itself —
+                 pinned to the radio payload limit in ESP-NOW mode, lower-bounded
+                 to a full MAVLink frame on WiFi links — so this setting no longer
+                 does anything a user should touch. The field stays in the form so
+                 the settings load/save JS keeps working unchanged. -->
+            <div id="trans_pack_size_div" class="row" style="display: none;">
                 <div class="six columns">
                     <label for="trans_pack_size">Maximum packet size</label>
                     <select id="trans_pack_size" name="trans_pack_size" form="settings_form">

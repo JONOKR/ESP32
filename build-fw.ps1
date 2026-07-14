@@ -6,13 +6,21 @@
 #   .\build-fw.ps1                  # build all three: esp32c3, esp32c6, esp32s3
 #   .\build-fw.ps1 -Chips esp32c3   # build one
 #   .\build-fw.ps1 -Chips esp32c6 -Serial usb   # GND image: MAVLink data over the USB-C port
+#   .\build-fw.ps1 -Chips esp32c3 -Role air     # role-baked JONOKR image (see below)
 #   .\build-fw.ps1 -Clean           # fullclean rebuild of the selected chips
+#
+# -Role air|gnd|beacon : JONOKR provisioning image — bakes the role's boot defaults into the
+#                        firmware (ESP-NOW AIR / ESP-NOW GND / GPS-beacon; see main/CMakeLists.txt),
+#                        so a freshly-erased unit needs zero web-UI configuration. gnd implies the
+#                        USB/JTAG data port (plugs into the GCS over USB-C); air/beacon use the GPIO
+#                        UART (FC / GPS). Builds into build\<chip>-<role>\.
 #
 # -Serial uart (default): data on the GPIO UART - use for AIR units wired to a flight controller.
 # -Serial usb           : data on the native USB/JTAG port, so a GND unit plugs straight into the
 #                         GCS computer with no UART-to-USB adapter. Builds into build\<chip>-usb\ so
 #                         it never clobbers the UART image. NOTE: no console logs over USB in this
 #                         mode (that port now carries MAVLink data instead).
+#                         (Ignored when -Role is given — the role decides the data port.)
 #
 # Requires: Docker Desktop running. First run builds the image 'jonokr-idf' (a few minutes).
 #requires -Version 5
@@ -20,8 +28,12 @@
 param(
     [ValidateSet('esp32c3', 'esp32c6', 'esp32s3')][string[]]$Chips = @('esp32c3', 'esp32c6', 'esp32s3'),
     [ValidateSet('uart', 'usb')][string]$Serial = 'uart',
+    [ValidateSet('air', 'gnd', 'beacon')][string]$Role,
     [switch]$Clean
 )
+
+# The role decides the data port: GND talks to the GCS over USB-C, AIR/beacon use the UART.
+if ($Role) { $Serial = if ($Role -eq 'gnd') { 'usb' } else { 'uart' } }
 
 function Fail($msg) { Write-Host "ERROR: $msg" -ForegroundColor Red; exit 1 }
 
@@ -46,9 +58,11 @@ if (-not (docker images -q $image)) {
 }
 
 foreach ($chip in $Chips) {
-    # USB/JTAG-serial images build into build\<chip>-usb\ so they never overwrite the UART image.
-    $variant = if ($Serial -eq 'usb') { "$chip-usb" } else { $chip }
-    Write-Host "`n==> [$variant] building ($Serial serial) ..." -ForegroundColor Cyan
+    # Role images build into build\<chip>-<role>\, USB/JTAG-serial images into build\<chip>-usb\ —
+    # each variant keeps its own build dir so images never overwrite each other.
+    $variant = if ($Role) { "$chip-$Role" } elseif ($Serial -eq 'usb') { "$chip-usb" } else { $chip }
+    $roleLabel = if ($Role) { ", role $Role" } else { '' }
+    Write-Host "`n==> [$variant] building ($Serial serial$roleLabel) ..." -ForegroundColor Cyan
     $bdir = "build/$variant"                                 # forward slashes for the Linux container
     $cfg  = "-B $bdir -D SDKCONFIG=$bdir/sdkconfig"
     if ($Serial -eq 'usb') {
@@ -56,6 +70,11 @@ foreach ($chip in $Chips) {
         # secondary USB console, as that Kconfig option requires). It is self-contained, so it
         # fully replaces sdkconfig.defaults - a single file, no semicolon list / shell-quoting needed.
         $cfg += " -D SDKCONFIG_DEFAULTS=config_defaults/sdkconfig.defaults.USBSerial"
+    }
+    if ($Role) {
+        # Bake the role's boot defaults into the image (main/CMakeLists.txt maps this to
+        # DB_BUILD_DEFAULT_* compile definitions). Uppercase to match the CMake comparisons.
+        $cfg += " -D DB_ROLE=$($Role.ToUpper())"
     }
     $configured = Test-Path (Join-Path $repo "build\$variant\sdkconfig")
 
@@ -74,9 +93,10 @@ foreach ($chip in $Chips) {
     Write-Host "==> [$variant] done -> build\$variant" -ForegroundColor Green
 }
 
-$flashSerial = if ($Serial -eq 'usb') { ' -Serial usb' } else { '' }
+$flashArgsHint = if ($Role) { " -Role $Role" } elseif ($Serial -eq 'usb') { ' -Serial usb' } else { '' }
 Write-Host "`nFlash it:" -ForegroundColor Yellow
-Write-Host "  USB cable :  .\flash-fw.ps1 -Chip $($Chips[0])$flashSerial -Port COM16"
+Write-Host "  USB cable :  .\flash-fw.ps1 -Chip $($Chips[0])$flashArgsHint -Port COM16"
+Write-Host "  GUI       :  python flash-gui.py   (or double-click Flasher.cmd)"
 Write-Host "  Browser   :  .\webflasher.ps1   (then open http://localhost:8000 in Chrome/Edge)"
 
 # The firmware build succeeded by this point; merge-bin is best-effort. Exit 0 explicitly so a

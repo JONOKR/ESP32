@@ -11,7 +11,7 @@ container** — nothing Espressif-native is installed on your Windows host.
 | `build-fw.ps1` | Builds firmware for each chip inside the container → `build\<chip>\`. |
 | `flash-fw.ps1` | Flashes a build onto the device from the host with `esptool` (USB cable). |
 | `webflasher.ps1` | Optional: generates & serves a browser flasher — flash from Chrome/Edge, zero host install. |
-| `flash-gui.py` | **Visual desktop app** (Tkinter): chip + port dropdowns, Build/Flash buttons, live log. Wraps the scripts above — no new dependencies. Launch: `python flash-gui.py` or double-click `Flasher.cmd`. |
+| `flash-gui.py` | **Visual desktop app** (Tkinter): pick the **unit type** (air / ground / beacon), pick the COM port, click **Flash & configure** — chip is auto-detected, the image is built on first use, the flash is erased, and the unit boots straight into its role with zero web-UI configuration. Launch: `python flash-gui.py` or double-click `Flasher.cmd`. |
 
 ## Prerequisites
 - **Docker Desktop**, running (`winget install Docker.DockerDesktop`; needs WSL2 via `wsl --install`).
@@ -19,28 +19,38 @@ container** — nothing Espressif-native is installed on your Windows host.
   - …or skip Python and use the **browser flasher** (`webflasher.ps1`) — nothing to install.
 - You do **not** need ESP-IDF or Node.js on the host — both live inside the container.
 
-## Easiest: the visual app
+## Easiest: the visual app (one-click provisioning)
 ```powershell
 python flash-gui.py            # or just double-click Flasher.cmd
 ```
-Opens a window with **chip** + **COM-port** dropdowns, **Build** and **Flash** buttons, an
-optional *Erase* checkbox, and a live log. It simply runs the scripts below underneath, so the
-same Docker build + host-esptool flash happen — just with buttons instead of typing.
+Pick the **unit type**, plug the board in, click **Flash & configure**:
 
-## Build
+| Unit type | What you get |
+|---|---|
+| **air**    | ESP-NOW AIR unit — wire the UART to the flight controller. |
+| **ground** | ESP-NOW GND station — plugs into the GCS computer over USB-C, shows up as a COM port. |
+| **beacon** | GPS beacon / armband — wire the UART to a u-blox GPS (MicoAir M10, 115200 baud); it streams its position to the GCS automatically. |
+
+The tool auto-detects the chip (C3/C6/S3), builds the role image on first use
+(Docker, a few minutes once), **always erases the flash**, and writes the image.
+The role's settings are baked into the firmware, so the unit needs **no web-UI
+configuration** — it boots straight into its job. There is nothing else to set.
+
+## Build (CLI)
 ```powershell
-.\build-fw.ps1                 # all three: esp32c3, esp32c6, esp32s3
-.\build-fw.ps1 -Chips esp32c3  # just one
-.\build-fw.ps1 -Clean          # fullclean rebuild
+.\build-fw.ps1                          # stock images, all three chips
+.\build-fw.ps1 -Chips esp32c3 -Role air # role-baked JONOKR image (air | gnd | beacon)
+.\build-fw.ps1 -Clean                   # fullclean rebuild
 ```
 The first run builds the `jonokr-idf` image (a few minutes), then compiles. Re-runs are
-incremental: edit code → re-run `build-fw.ps1` → re-flash.
+incremental: edit code → re-run `build-fw.ps1` → re-flash. Role images build into
+`build\<chip>-<role>\` and never clobber the stock images.
 
 ## Flash — option A: USB cable + esptool (host)
 ```powershell
-.\flash-fw.ps1 -Chip esp32c3                    # auto-detects the COM port if exactly one
-.\flash-fw.ps1 -Chip esp32c3 -Port COM4         # or specify it
-.\flash-fw.ps1 -Chip esp32c6 -Port COM7 -Erase  # also factory-wipe NVS (WiFi/config)
+.\flash-fw.ps1 -Chip esp32c3 -Role air -Port COM4   # provision a role unit (always erases)
+.\flash-fw.ps1 -Chip esp32c3                        # stock image; auto-detects the port if exactly one
+.\flash-fw.ps1 -Chip esp32c6 -Port COM7 -Erase      # stock + factory-wipe NVS (WiFi/config)
 ```
 Find the COM port in Device Manager → *Ports (COM & LPT)*.
 
