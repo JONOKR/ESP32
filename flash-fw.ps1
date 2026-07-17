@@ -79,7 +79,7 @@ if ($Role) {
     $roleMsg = switch ($Role) {
         'air'    { "AIR unit ready - wire the UART to the flight controller; it joins the ESP-NOW net automatically." }
         'gnd'    { "GND unit ready - plug it into the GCS computer over USB-C; it appears as a COM port." }
-        'beacon' { "Beacon ready - wire the UART to the u-blox GPS (115200); position streams to the GCS automatically." }
+        'beacon' { "Beacon ready - wire the u-blox GPS (230400 baud) to RX=GPIO20/TX=GPIO21; position streams to the GCS automatically." }
     }
     Write-Host "`n==> [$Chip/$Role] flashed on $Port. $roleMsg" -ForegroundColor Green
 } else {

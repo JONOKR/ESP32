@@ -33,10 +33,14 @@ if(DEFINED DB_ROLE)
         target_compile_definitions(${COMPONENT_LIB} PRIVATE
                 "DB_BUILD_DEFAULT_RADIO_MODE=DB_WIFI_MODE_ESPNOW_GND")
     elseif(DB_ROLE STREQUAL "BEACON")
+        # Matches the verified GPS_beacon_example.cpp hardware: MicoAir M10
+        # Ultra (factory 230400 baud) wired to ESP RX=GPIO20 / TX=GPIO21.
         target_compile_definitions(${COMPONENT_LIB} PRIVATE
                 "DB_BUILD_DEFAULT_RADIO_MODE=DB_WIFI_MODE_ESPNOW_AIR"
                 "DB_BUILD_DEFAULT_SERIAL_PROTO=DB_SERIAL_PROTOCOL_UBX_BEACON"
-                "DB_BUILD_DEFAULT_BAUD=115200")
+                "DB_BUILD_DEFAULT_BAUD=230400"
+                "DB_BUILD_DEFAULT_GPIO_TX=21"
+                "DB_BUILD_DEFAULT_GPIO_RX=20")
     else()
         message(FATAL_ERROR "Unknown DB_ROLE '${DB_ROLE}' (use AIR, GND or BEACON)")
     endif()

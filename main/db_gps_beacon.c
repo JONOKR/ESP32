@@ -38,10 +38,13 @@
 
 // Emission cadence. Position rides at the GPS fix rate (CFG-RATE below);
 // heartbeat + raw fix info at 1 Hz keep the GCS registry + fix display alive.
-#define BEACON_GPS_MEAS_RATE_MS 200      // 5 Hz NAV-PVT
+// 1 Hz navigation rate matches the hardware-verified GPS_beacon_example.cpp
+// (setNavigationFrequency(1)); raise CFG-RATE-MEAS here if the trajectory
+// features later need denser beacon tracks.
+#define BEACON_GPS_MEAS_RATE_MS 1000     // 1 Hz NAV-PVT
 #define BEACON_HEARTBEAT_US     1000000  // 1 Hz
 #define BEACON_GPS_RAW_US       1000000  // 1 Hz
-#define BEACON_GPS_CFG_RETRY_US 5000000  // re-send GPS config every 5 s until PVT flows
+#define BEACON_GPS_CFG_RETRY_US 5000000  // (re)send GPS config every 5 s until PVT flows
 
 // MAVLink identity: beacons take part in the GCS fleet system exactly like
 // drones. Factory-fresh they heartbeat sysid 1 ("unnumbered", same semantics
@@ -232,18 +235,27 @@ static void ubx_checksum(const uint8_t *data, uint16_t len, uint8_t *ck_a, uint8
 }
 
 /**
- * Configure the GPS for our needs via UBX-CFG-VALSET (RAM layer, M9/M10 —
- * an older M8 NAKs it, harmless): enable NAV-PVT on UART1 and set the
- * measurement rate to BEACON_GPS_MEAS_RATE_MS. Sent blind (no ACK handling);
- * re-sent every BEACON_GPS_CFG_RETRY_US until PVT frames actually flow, so a
- * GPS that boots slower than the ESP32 still gets configured.
+ * Configure the GPS via UBX-CFG-VALSET (M9/M10 — an older M8 NAKs it,
+ * harmless). Mirrors the hardware-verified GPS_beacon_example.cpp setup:
+ *   setUART1Output(COM_TYPE_UBX)  -> UBX out on, NMEA out off (UART1)
+ *   setAutoPVT(true)              -> NAV-PVT pushed on UART1
+ *   setNavigationFrequency(...)   -> CFG-RATE-MEAS
+ *   saveConfiguration()           -> persisted (layers RAM+BBR+Flash here)
+ * Sent blind (no ACK handling) and re-sent every BEACON_GPS_CFG_RETRY_US
+ * until PVT frames actually flow — so a GPS that boots slower than the ESP32
+ * still gets configured, while an already-persisted GPS streams immediately
+ * and never triggers a config (no repeated flash writes).
  */
 static void db_beacon_send_gps_config(void) {
-    // VALSET payload: version(1)=0, layers(1)=1 (RAM), reserved(2), cfgData...
+    // VALSET payload: version(1)=0, layers(1)=7 (RAM+BBR+Flash), reserved(2), cfgData...
+    //   CFG-UART1OUTPROT-UBX  (0x10740001, L)  = 1
+    //   CFG-UART1OUTPROT-NMEA (0x10740002, L)  = 0
     //   CFG-MSGOUT-UBX_NAV_PVT_UART1 (0x20910007, U1) = 1
-    //   CFG-RATE-MEAS               (0x30210001, U2) = BEACON_GPS_MEAS_RATE_MS
-    uint8_t payload[4 + 5 + 6] = {
-            0x00, 0x01, 0x00, 0x00,
+    //   CFG-RATE-MEAS         (0x30210001, U2) = BEACON_GPS_MEAS_RATE_MS
+    uint8_t payload[4 + 5 + 5 + 5 + 6] = {
+            0x00, 0x07, 0x00, 0x00,
+            0x01, 0x00, 0x74, 0x10, 0x01,
+            0x02, 0x00, 0x74, 0x10, 0x00,
             0x07, 0x00, 0x91, 0x20, 0x01,
             0x01, 0x00, 0x21, 0x30,
             (uint8_t) (BEACON_GPS_MEAS_RATE_MS & 0xFF), (uint8_t) (BEACON_GPS_MEAS_RATE_MS >> 8),
@@ -445,6 +457,10 @@ void db_gps_beacon_process(int *tcp_clients, udp_conn_list_t *udp_conns) {
         uint8_t assigned = db_beacon_load_assigned_sysid();
         beacon_sysid = (assigned != 0) ? assigned : BEACON_SYSID_UNNUMBERED;
         DB_MAV_SYS_ID = beacon_sysid;
+        // Give an already-configured GPS (config persisted to its flash on a
+        // previous run) one full retry period to start streaming PVT before we
+        // send the config — avoids rewriting the GPS flash on every boot.
+        last_gps_cfg_us = now_us;
         ESP_LOGI(TAG, "GPS beacon role active — sysid %i (%s), GPS expected at %li baud",
                  beacon_sysid, (assigned != 0) ? "fleet-assigned" : "unnumbered",
                  (long) DB_PARAM_SERIAL_BAUD);

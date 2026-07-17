@@ -176,8 +176,10 @@ db_parameter_t db_param_gpio_tx = {
         },
         .value = {
                 .db_param_u8 = {
-                        .value = DB_DEFAULT_UART_TX_PIN,
-                        .default_value = DB_DEFAULT_UART_TX_PIN,
+                        // Role-baked default (see db_parameters.h): beacon images
+                        // wire the GPS on fixed pins; other builds keep the board default.
+                        .value = DB_BUILD_DEFAULT_GPIO_TX,
+                        .default_value = DB_BUILD_DEFAULT_GPIO_TX,
                         .min = 0,
                         .max = SOC_GPIO_IN_RANGE_MAX,
                 }
@@ -197,8 +199,9 @@ db_parameter_t db_param_gpio_rx = {
         },
         .value = {
                 .db_param_u8 = {
-                        .value = DB_DEFAULT_UART_RX_PIN,
-                        .default_value = DB_DEFAULT_UART_RX_PIN,
+                        // Role-baked default (see db_parameters.h), like gpio_tx above.
+                        .value = DB_BUILD_DEFAULT_GPIO_RX,
+                        .default_value = DB_BUILD_DEFAULT_GPIO_RX,
                         .min = 0,
                         .max = SOC_GPIO_IN_RANGE_MAX,
                 }

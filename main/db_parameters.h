@@ -128,6 +128,12 @@ enum E_DB_SERIAL_PROTOCOL {
 #ifndef DB_BUILD_DEFAULT_BAUD
 #define DB_BUILD_DEFAULT_BAUD DB_DEFAULT_UART_BAUD_RATE
 #endif
+#ifndef DB_BUILD_DEFAULT_GPIO_TX
+#define DB_BUILD_DEFAULT_GPIO_TX DB_DEFAULT_UART_TX_PIN
+#endif
+#ifndef DB_BUILD_DEFAULT_GPIO_RX
+#define DB_BUILD_DEFAULT_GPIO_RX DB_DEFAULT_UART_RX_PIN
+#endif
 
 typedef struct db_parameter_str_s {
     uint8_t *value;

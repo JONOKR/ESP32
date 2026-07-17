@@ -29,7 +29,7 @@ Pick the **unit type**, plug the board in, click **Flash & configure**:
 |---|---|
 | **air**    | ESP-NOW AIR unit — wire the UART to the flight controller. |
 | **ground** | ESP-NOW GND station — plugs into the GCS computer over USB-C, shows up as a COM port. |
-| **beacon** | GPS beacon / armband — wire the UART to a u-blox GPS (MicoAir M10, 115200 baud); it streams its position to the GCS automatically. |
+| **beacon** | GPS beacon / armband — wire the u-blox GPS (MicoAir M10 Ultra, factory 230400 baud) to ESP **RX=GPIO20 / TX=GPIO21**; it streams its position to the GCS automatically. |
 
 The tool auto-detects the chip (C3/C6/S3), builds the role image on first use
 (Docker, a few minutes once), **always erases the flash**, and writes the image.

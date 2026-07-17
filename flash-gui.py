@@ -41,7 +41,7 @@ FLASH_PS1 = os.path.join(REPO, "flash-fw.ps1")
 ROLES = {
     "air":    ("air",    "wired to the flight controller (UART) — joins the ESP-NOW net"),
     "ground": ("gnd",    "plugs into the GCS computer over USB-C — appears as a COM port"),
-    "beacon": ("beacon", "u-blox GPS on the UART (115200) — streams its position to the GCS"),
+    "beacon": ("beacon", "u-blox GPS on RX=GPIO20/TX=GPIO21 (230400 baud) — streams its position to the GCS"),
 }
 SUPPORTED_CHIPS = ("esp32c3", "esp32c6", "esp32s3")
 PCT_RE = re.compile(r"\((\d+)\s*%\)")
