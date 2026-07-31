@@ -87,8 +87,10 @@ db_parameter_t db_param_channel = {
         },
         .value = {
                 .db_param_u8 = {
-                        .value = 6,
-                        .default_value = 6,
+                        // Role-baked default (see db_parameters.h). Stock and
+                        // every JONOKR role currently agree on channel 6.
+                        .value = DB_BUILD_DEFAULT_CHANNEL,
+                        .default_value = DB_BUILD_DEFAULT_CHANNEL,
                         .min = 1,
                         .max = 13,
                 }
@@ -132,8 +134,11 @@ db_parameter_t db_param_radio_ant_ext = {
         },
         .value = {
                 .db_param_u8 = {
-                        .value = false,
-                        .default_value = false,
+                        // Role-baked default (see db_parameters.h): JONOKR
+                        // role images (air/gnd/beacon) default to the
+                        // external antenna - they're field/long-range units.
+                        .value = DB_BUILD_DEFAULT_EN_EXT_ANT,
+                        .default_value = DB_BUILD_DEFAULT_EN_EXT_ANT,
                         .min = false,
                         .max = true,
                 }

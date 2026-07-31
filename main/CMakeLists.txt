@@ -26,6 +26,13 @@ idf_component_register(SRCS ${SRCS}
 # flasher GUI produces units that need zero web-UI configuration. The values
 # are passed as the enum SYMBOLS, evaluated in C where the enums are defined.
 if(DEFINED DB_ROLE)
+    # Common to every role: these are field/long-range units, so default to
+    # the external antenna. Channel is explicit (not just relying on the
+    # stock default) so all three roles are guaranteed to agree even if the
+    # stock default ever changes upstream.
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE
+            "DB_BUILD_DEFAULT_CHANNEL=6"
+            "DB_BUILD_DEFAULT_EN_EXT_ANT=true")
     if(DB_ROLE STREQUAL "AIR")
         target_compile_definitions(${COMPONENT_LIB} PRIVATE
                 "DB_BUILD_DEFAULT_RADIO_MODE=DB_WIFI_MODE_ESPNOW_AIR")

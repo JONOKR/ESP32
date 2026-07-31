@@ -1,0 +1,9 @@
+# Host-side Python dependencies for ESP32 firmware flashing
+# (build-fw.ps1 / flash-fw.ps1 / flash-gui.py). NOT needed to build the
+# firmware itself - that runs inside the Docker image (flash-tool/Dockerfile).
+#
+#   pip install -r requirements.txt
+#
+esptool<5       # host-side flashing over USB (esptool v5 renamed some CLI
+                # commands the flash scripts rely on - keep pinned below 5)
+pyserial>=3.5   # COM-port listing in flash-gui.py (esptool depends on it too)

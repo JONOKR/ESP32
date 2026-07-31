@@ -11,7 +11,7 @@
 # build-fw.ps1 -Role ...) and ALWAYS erases first: the role's boot defaults only take
 # effect on a clean NVS — that's the whole point of provisioning.
 #
-# Requires on host:  pip install "esptool<5"
+# Requires on host:  pip install -r requirements.txt
 # (No-Python option: use the browser flasher .\webflasher.ps1 instead - nothing to install.)
 #requires -Version 5
 [CmdletBinding()]
@@ -41,10 +41,10 @@ if (-not (Test-Path (Join-Path $buildDir 'flash_args'))) {
 
 # esptool available on the host?
 if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
-    Fail "Python not found on PATH. Install Python 3, then:  pip install `"esptool<5`""
+    Fail "Python not found on PATH. Install Python 3, then:  pip install -r requirements.txt"
 }
 python -m esptool version 2>&1 | Out-Null
-if ($LASTEXITCODE -ne 0) { Fail "esptool is not installed for this Python. Run:  pip install `"esptool<5`"" }
+if ($LASTEXITCODE -ne 0) { Fail "esptool is not installed for this Python. Run:  pip install -r requirements.txt" }
 
 # resolve the COM port
 if (-not $Port) {

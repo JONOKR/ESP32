@@ -718,6 +718,12 @@ void app_main() {
     ESP_ERROR_CHECK(ret);
     db_read_settings_nvs();
     DB_RADIO_MODE_DESIGNATED = DB_PARAM_RADIO_MODE; // must always match, mismatch only allowed when changed by user action and not rebooted, yet.
+    // Resolved boot config, straight from a serial monitor: makes it
+    // immediately obvious whether a role-baked build's defaults actually
+    // took effect (vs. NVS holding a stale/prior value, or a stale build).
+    ESP_LOGI(TAG, "Boot config: radio_mode=%i serial_proto=%i baud=%li chan=%i ext_ant=%i",
+             DB_PARAM_RADIO_MODE, DB_PARAM_SERIAL_PROTO, (long) DB_PARAM_SERIAL_BAUD,
+             DB_PARAM_CHANNEL, DB_PARAM_EN_EXT_ANT);
     set_reset_trigger();
     db_configure_antenna();
     db_status_led_init();

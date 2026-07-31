@@ -15,12 +15,14 @@ erase guarantees they take effect.
 
   air    - ESP-NOW AIR unit: UART wired to the flight controller.
   ground - ESP-NOW GND station: plugs into the GCS computer over USB-C.
-  beacon - GPS beacon/armband: UART wired to a u-blox GPS (115200 baud);
+  beacon - GPS beacon/armband: u-blox GPS on RX=GPIO20/TX=GPIO21 (230400 baud);
            streams its position to the GCS automatically.
 
-Pure Python standard library (tkinter) + pyserial (installed with esptool)
-for COM-port listing. All real work happens in the reviewed PowerShell
-scripts + esptool.
+Host-side requirements (one-time):  pip install -r requirements.txt
+(esptool + pyserial — the tool checks for these at launch and announces
+clearly if either is missing, rather than failing silently mid-flash.)
+
+All real work happens in the reviewed PowerShell scripts + esptool.
 
 Launch:  python flash-gui.py     (or double-click Flasher.cmd)
 """
@@ -36,6 +38,9 @@ from tkinter.scrolledtext import ScrolledText
 REPO = os.path.dirname(os.path.abspath(__file__))
 BUILD_PS1 = os.path.join(REPO, "build-fw.ps1")
 FLASH_PS1 = os.path.join(REPO, "flash-fw.ps1")
+# Launched from the repo folder (see the module docstring), so the relative
+# form is what a user should actually type.
+ESPTOOL_INSTALL_HINT = "pip install -r requirements.txt"
 
 # GUI label -> (script role value, one-line description)
 ROLES = {
@@ -134,6 +139,7 @@ class FlasherApp:
         self._check_scripts()
         self._show_role_hint()
         self.refresh_ports()
+        self._check_esptool_async()
         self.root.after(80, self._drain)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -148,6 +154,33 @@ class FlasherApp:
     def _show_role_hint(self):
         _script_role, hint = ROLES[self.role.get()]
         self.role_hint.config(text=f"{self.role.get()}: {hint}")
+
+    def _check_esptool_async(self):
+        """Announce a missing esptool up front, at launch — not just when a
+        Flash/Build click fails on it. Runs in a background thread so the
+        window opens immediately; result lands via the normal queue/_drain."""
+        def check():
+            try:
+                ver = subprocess.run(
+                    ["python", "-m", "esptool", "version"],
+                    cwd=REPO, capture_output=True, text=True, encoding="utf-8",
+                    errors="replace", timeout=15, creationflags=NO_WINDOW,
+                )
+            except FileNotFoundError:
+                self.q.put(("line",
+                    "NOTE: python not found on PATH - install Python 3, then:  "
+                    + ESPTOOL_INSTALL_HINT + "\n"))
+                return
+            except subprocess.TimeoutExpired:
+                return  # don't nag on a flaky check; the per-click check below will catch it
+            out = ((ver.stdout or "") + (ver.stderr or "")).strip()
+            if ver.returncode != 0:
+                self.q.put(("line",
+                    "NOTE: esptool is not installed for this Python — Flash/Build won't "
+                    f"work until you run:\n      {ESPTOOL_INSTALL_HINT}\n"))
+            else:
+                self.q.put(("line", f"[esptool] {out.splitlines()[-1] if out else 'ok'}\n"))
+        threading.Thread(target=check, daemon=True).start()
 
     def refresh_ports(self):
         ports = list_serial_ports()
@@ -225,24 +258,54 @@ class FlasherApp:
 
     def _detect_chip(self, port):
         """Ask esptool which chip is on the port. Returns 'esp32c3' etc. or None."""
-        self.q.put(("status", "Detecting chip ..."))
-        self.q.put(("line", f"[detect] querying {port} ...\n"))
+        self.q.put(("status", "Checking esptool ..."))
         try:
-            out = subprocess.run(
-                ["python", "-m", "esptool", "--port", port, "chip_id"],
+            ver = subprocess.run(
+                ["python", "-m", "esptool", "version"],
+                cwd=REPO, capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=15, creationflags=NO_WINDOW,
+            )
+        except FileNotFoundError:
+            self.q.put(("line", "python not found on PATH - install Python 3, then:  " + ESPTOOL_INSTALL_HINT + "\n"))
+            return None
+        except subprocess.TimeoutExpired:
+            self.q.put(("line", "checking esptool timed out\n"))
+            return None
+        # esptool prints to stdout normally, but errors (incl. "No module
+        # named esptool" from a missing install) can land on stderr - merge
+        # both so a real failure is never silently swallowed.
+        ver_out = ((ver.stdout or "") + (ver.stderr or "")).strip()
+        if ver.returncode != 0:
+            self.q.put(("line", "esptool is not installed for this Python. Run:  " + ESPTOOL_INSTALL_HINT + "\n"))
+            if ver_out:
+                self.q.put(("line", "  " + ver_out.splitlines()[-1] + "\n"))
+            return None
+
+        self.q.put(("status", "Detecting chip ..."))
+        # flash_id (not chip_id): chip_id is explicitly UNSUPPORTED on
+        # ESP32-C3/C6/S3 - esptool connects fine, detects the chip, then
+        # errors on the command itself. flash_id works on every chip we
+        # support and still prints the same "Chip is ESP32-Cx" line.
+        self.q.put(("line", f"[detect] querying {port} (esptool flash_id) ...\n"))
+        try:
+            result = subprocess.run(
+                ["python", "-m", "esptool", "--port", port, "flash_id"],
                 cwd=REPO, capture_output=True, text=True, encoding="utf-8",
                 errors="replace", timeout=30, creationflags=NO_WINDOW,
-            ).stdout
-        except FileNotFoundError:
-            self.q.put(("line", "python/esptool not found - install Python 3 and:  pip install \"esptool<5\"\n"))
-            return None
+            )
         except subprocess.TimeoutExpired:
             self.q.put(("line", "chip detection timed out - hold BOOT/IO0, tap RST, try again\n"))
             return None
-        m = CHIP_RE.search(out or "")
+        out = ((result.stdout or "") + (result.stderr or "")).strip()
+        m = CHIP_RE.search(out)
         if not m:
-            tail = "\n".join((out or "").splitlines()[-4:])
+            tail = "\n".join(out.splitlines()[-12:]) if out else "(esptool produced no output)"
             self.q.put(("line", f"could not detect the chip:\n{tail}\n"))
+            low = out.lower()
+            if "could not open" in low or "permission" in low or "access is denied" in low:
+                self.q.put(("line", "  -> is another program (Arduino IDE, a serial monitor, another Flasher window) using this port?\n"))
+            elif "no serial data received" in low or "connecting..." in low:
+                self.q.put(("line", "  -> hold BOOT/IO0, tap RST (keep holding BOOT a moment), then retry\n"))
             return None
         chip = m.group(1).lower().replace("-", "")
         if chip not in SUPPORTED_CHIPS:

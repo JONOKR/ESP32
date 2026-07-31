@@ -134,6 +134,14 @@ enum E_DB_SERIAL_PROTOCOL {
 #ifndef DB_BUILD_DEFAULT_GPIO_RX
 #define DB_BUILD_DEFAULT_GPIO_RX DB_DEFAULT_UART_RX_PIN
 #endif
+// Fallbacks match the pre-existing stock defaults in db_parameters.c (channel
+// 6, internal antenna) so a build with no -D DB_ROLE is unchanged.
+#ifndef DB_BUILD_DEFAULT_CHANNEL
+#define DB_BUILD_DEFAULT_CHANNEL 6
+#endif
+#ifndef DB_BUILD_DEFAULT_EN_EXT_ANT
+#define DB_BUILD_DEFAULT_EN_EXT_ANT false
+#endif
 
 typedef struct db_parameter_str_s {
     uint8_t *value;

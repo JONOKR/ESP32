@@ -65,11 +65,21 @@ foreach ($chip in $Chips) {
     Write-Host "`n==> [$variant] building ($Serial serial$roleLabel) ..." -ForegroundColor Cyan
     $bdir = "build/$variant"                                 # forward slashes for the Linux container
     $cfg  = "-B $bdir -D SDKCONFIG=$bdir/sdkconfig"
+    # Pick the sdkconfig overlay. Each file is self-contained, so it fully replaces
+    # sdkconfig.defaults - a single file, no semicolon list / shell-quoting needed.
+    #   -Serial usb / gnd role : USBSerial     - data on the USB/JTAG port (frees the
+    #                            secondary USB console, as that Kconfig option requires).
+    #   air / beacon role      : noUARTConsole - data stays on the GPIO UART and the CONSOLE
+    #                            moves to USB. Critical: the default console is UART0, whose
+    #                            pins are GPIO20/21 on the ESP32-C3 - exactly the pins the
+    #                            beacon drives its u-blox GPS on. Leaving the console there
+    #                            puts two peripherals on one pin pair (garbled GPS, corrupted
+    #                            UBX config writes). Moving it to USB also means boot logs are
+    #                            finally visible on the USB port for these roles.
     if ($Serial -eq 'usb') {
-        # Layer on the ready-made USB/JTAG overlay (flips data serial to USB/JTAG and frees the
-        # secondary USB console, as that Kconfig option requires). It is self-contained, so it
-        # fully replaces sdkconfig.defaults - a single file, no semicolon list / shell-quoting needed.
         $cfg += " -D SDKCONFIG_DEFAULTS=config_defaults/sdkconfig.defaults.USBSerial"
+    } elseif ($Role) {
+        $cfg += " -D SDKCONFIG_DEFAULTS=config_defaults/sdkconfig.defaults.noUARTConsole"
     }
     if ($Role) {
         # Bake the role's boot defaults into the image (main/CMakeLists.txt maps this to
@@ -78,9 +88,18 @@ foreach ($chip in $Chips) {
     }
     $configured = Test-Path (Join-Path $repo "build\$variant\sdkconfig")
 
-    if     ($Clean -and $configured) { $action = "fullclean set-target $chip build" }
-    elseif ($configured)             { $action = "build" }
-    else                             { $action = "set-target $chip build" }
+    # Role builds ALWAYS get a fullclean + reconfigure when a build already
+    # exists for that variant, never a plain incremental "build" — even
+    # though CMake/Ninja normally recompile a source file whose effective -D
+    # flags changed, a Docker-bind-mount timestamp quirk or a build dir left
+    # over from before -Role existed could otherwise silently ship the
+    # PREVIOUS (e.g. stock AP-mode) defaults with no error. Provisioning is
+    # rare enough that the extra minute is worth the certainty. (fullclean
+    # needs an already-configured dir, hence still gated on $configured — a
+    # brand-new variant gets a normal fresh configure either way.)
+    if     ($configured -and ($Role -or $Clean)) { $action = "fullclean set-target $chip build" }
+    elseif ($configured)                         { $action = "build" }
+    else                                          { $action = "set-target $chip build" }
 
     docker run --rm -v "${repo}:/project" -w /project $image bash -c "idf.py $cfg $action"
     if ($LASTEXITCODE -ne 0) { Fail "[$chip] firmware build failed (exit $LASTEXITCODE)." }
