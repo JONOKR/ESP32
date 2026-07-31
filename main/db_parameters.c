@@ -41,7 +41,14 @@
  * eventually lead to crashes. Stores the new Wi-Fi mode and will be written to the settings. This means it will
  * become active after reboot.
  */
-uint8_t DB_RADIO_MODE_DESIGNATED = DB_WIFI_MODE_AP; // initially assign the same value as DB_RADIO_MODE
+// Must start out matching db_param_radio_mode's default, NOT a hardcoded AP:
+// db_param_write_all_params_nvs() persists THIS variable for the radio mode, and
+// on a factory-fresh unit that write happens (db_read_settings_nvs) before
+// app_main gets a chance to sync the two. Hardcoding AP here silently wrote
+// esp32_mode=1 into the NVS of a role-baked image while every other parameter
+// stored its correct role default - so the unit ran in its role for exactly one
+// boot and came up as a Wi-Fi AP ever after.
+uint8_t DB_RADIO_MODE_DESIGNATED = DB_BUILD_DEFAULT_RADIO_MODE; // initially assign the same value as DB_RADIO_MODE
 
 /* ---------- String based parameters - not available via MAVLink ---------- */
 

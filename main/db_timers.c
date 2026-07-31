@@ -118,7 +118,11 @@ void db_timer_start_mavlink_heartbeat() {
  * @param pxTimer
  */
 void db_timer_mavlink_radiostatus_callback(TimerHandle_t pxTimer) {
-    if (DB_PARAM_SERIAL_PROTO != DB_SERIAL_PROTOCOL_MAVLINK) {
+    // The GPS beacon speaks UBX on its serial port but MAVLink on the radio, so
+    // it must report link quality too - otherwise the GCS shows a beacon with no
+    // signal strength at all. Every other non-MAVLink protocol stays excluded.
+    if (DB_PARAM_SERIAL_PROTO != DB_SERIAL_PROTOCOL_MAVLINK &&
+        DB_PARAM_SERIAL_PROTO != DB_SERIAL_PROTOCOL_UBX_BEACON) {
         return; // Do not send heartbeat in transparent mode
     }
     static uint8_t buff[296];

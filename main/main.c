@@ -584,6 +584,14 @@ void db_read_settings_nvs() {
         // Set all parameters to their default values when flash is empty
         db_param_reset_all();
 
+        // The radio mode is persisted from DB_RADIO_MODE_DESIGNATED rather than
+        // from the parameter itself (see db_param_write_all_params_nvs), so it
+        // has to be re-synced here or this very first write stores a stale mode
+        // and the role-baked default is lost on the next boot. Deliberately NOT
+        // folded into db_param_reset_all(): the reset-button handlers set
+        // DESIGNATED to AP on purpose, as the escape hatch back to the web UI.
+        DB_RADIO_MODE_DESIGNATED = DB_PARAM_RADIO_MODE;
+
         // Now save these defaults to NVS
         db_write_settings_to_nvs();
 
