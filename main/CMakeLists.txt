@@ -33,6 +33,18 @@ if(DEFINED DB_ROLE)
     target_compile_definitions(${COMPONENT_LIB} PRIVATE
             "DB_BUILD_DEFAULT_CHANNEL=6"
             "DB_BUILD_DEFAULT_EN_EXT_ANT=true")
+    # Antenna switch, by board. These are Seeed XIAO units built against the
+    # generic board profile, so the Kconfig RF-switch path never compiles in and
+    # ant_use_ext would drive nothing (see db_configure_antenna). Only the XIAO
+    # ESP32-C6 has a switch at all - GPIO3 powers it (active low), GPIO14 picks
+    # the path (high = external u.FL). The C3/S3 XIAOs expose only the u.FL
+    # connector, with no onboard antenna to switch away from, so they define
+    # nothing here and the code drops out.
+    if(IDF_TARGET STREQUAL "esp32c6")
+        target_compile_definitions(${COMPONENT_LIB} PRIVATE
+                "DB_BUILD_RF_SWITCH_GPIO=14"
+                "DB_BUILD_RF_SWITCH_EN_GPIO=3")
+    endif()
     if(DB_ROLE STREQUAL "AIR")
         # UART to the flight controller. These MUST be pinned: the generic-board
         # default is GPIO0 for BOTH tx and rx ("user has to set the correct pins",

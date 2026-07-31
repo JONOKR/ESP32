@@ -701,7 +701,27 @@ void db_jtag_serial_info_print() {
  * Must be called before radio/Wi-Fi gets initialized!
  */
 void db_configure_antenna() {
-#if defined(CONFIG_DB_HAS_RF_SWITCH) && defined(CONFIG_DB_RF_SWITCH_GPIO) && (CONFIG_DB_RF_SWITCH_GPIO != 0)
+#if defined(DB_BUILD_RF_SWITCH_GPIO)
+    /* JONOKR role images build against the *generic* board profile, so the stock
+     * CONFIG_DB_HAS_RF_SWITCH path below is compiled out entirely and the
+     * ant_use_ext parameter drove nothing at all - it stored 1 and the board
+     * quietly kept transmitting on its onboard antenna. Drive the switch from
+     * the role build instead, so the setting is real without having to adopt a
+     * board profile whose UART pins are wrong for us.
+     *
+     * Seeed XIAO ESP32-C6: GPIO3 enables the RF switch (active LOW) and GPIO14
+     * selects the path - HIGH = external u.FL, LOW = onboard ceramic. Boards
+     * with only a u.FL connector (XIAO C3/S3) have no switch, so no GPIOs are
+     * defined for them and this whole block disappears. */
+#if defined(DB_BUILD_RF_SWITCH_EN_GPIO)
+    gpio_set_direction(DB_BUILD_RF_SWITCH_EN_GPIO, GPIO_MODE_OUTPUT);
+    gpio_set_level(DB_BUILD_RF_SWITCH_EN_GPIO, 0);   // active low: powers the switch
+#endif
+    gpio_set_direction(DB_BUILD_RF_SWITCH_GPIO, GPIO_MODE_OUTPUT);
+    gpio_set_level(DB_BUILD_RF_SWITCH_GPIO, DB_PARAM_EN_EXT_ANT);
+    ESP_LOGI(TAG, "RF switch on GPIO %i set to %s antenna", DB_BUILD_RF_SWITCH_GPIO,
+             DB_PARAM_EN_EXT_ANT ? "EXTERNAL" : "onboard");
+#elif defined(CONFIG_DB_HAS_RF_SWITCH) && defined(CONFIG_DB_RF_SWITCH_GPIO) && (CONFIG_DB_RF_SWITCH_GPIO != 0)
 #ifdef CONFIG_DB_OFFICIAL_BOARD_1_X_C6
     gpio_set_direction(GPIO_NUM_3, GPIO_MODE_OUTPUT);
     gpio_set_level(GPIO_NUM_3, 0); // set to low to enable RF switching
