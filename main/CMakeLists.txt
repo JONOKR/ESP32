@@ -34,8 +34,16 @@ if(DEFINED DB_ROLE)
             "DB_BUILD_DEFAULT_CHANNEL=6"
             "DB_BUILD_DEFAULT_EN_EXT_ANT=true")
     if(DB_ROLE STREQUAL "AIR")
+        # UART to the flight controller. These MUST be pinned: the generic-board
+        # default is GPIO0 for BOTH tx and rx ("user has to set the correct pins",
+        # db_parameters.h), so an unpinned AIR image joins the ESP-NOW mesh and
+        # shows up at the GCS while carrying no FC telemetry at all - the most
+        # confusing possible failure. Baud stays the 57600 default, which is what
+        # ArduPilot uses on its telemetry ports.
         target_compile_definitions(${COMPONENT_LIB} PRIVATE
-                "DB_BUILD_DEFAULT_RADIO_MODE=DB_WIFI_MODE_ESPNOW_AIR")
+                "DB_BUILD_DEFAULT_RADIO_MODE=DB_WIFI_MODE_ESPNOW_AIR"
+                "DB_BUILD_DEFAULT_GPIO_TX=21"
+                "DB_BUILD_DEFAULT_GPIO_RX=2")
     elseif(DB_ROLE STREQUAL "GND")
         target_compile_definitions(${COMPONENT_LIB} PRIVATE
                 "DB_BUILD_DEFAULT_RADIO_MODE=DB_WIFI_MODE_ESPNOW_GND")
