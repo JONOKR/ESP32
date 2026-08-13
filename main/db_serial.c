@@ -284,13 +284,20 @@ void db_parse_mavlink_from_radio(int *tcp_clients, udp_conn_list_t *udp_conns, u
                     memset(&db_tunnel, 0, sizeof(db_tunnel));
                     uint16_t db_copy_len = (msg.len < (uint16_t) sizeof(db_tunnel)) ? msg.len : (uint16_t) sizeof(db_tunnel);
                     memcpy(&db_tunnel, msg.payload, db_copy_len);
+                    // payload_length is a uint8_t straight off the wire, so it can claim up
+                    // to 255 while the payload array is only 128 bytes. Trusting it would
+                    // read ~127 bytes of adjacent stack and hand them to the flight
+                    // controller as MAVLink. The GCS never builds one larger than the array
+                    // (build_addressed_payload caps the inner frame), so anything bigger is
+                    // malformed by definition - drop the frame rather than clamp it.
                     if (db_tunnel.payload_length > ESP_NOW_ETH_ALEN &&
+                        (size_t) db_tunnel.payload_length <= sizeof(db_tunnel.payload) &&
                         memcmp(db_tunnel.payload, LOCAL_MAC_ADDRESS, ESP_NOW_ETH_ALEN) == 0) {
                         // Addressed to this AIR unit -> deliver the inner frame to our flight controller
                         write_to_serial(&db_tunnel.payload[ESP_NOW_ETH_ALEN],
                                         db_tunnel.payload_length - ESP_NOW_ETH_ALEN);
                     } else {
-                        // addressed to a different drone -> ignore
+                        // addressed to a different drone, or a bogus length -> ignore
                     }
                 } else if (db_tunnel_type == DB_ESPNOW_TUNNEL_FLEET_LIST) {
                     db_control_frame = true; // GND->GCS only; never hand it to an FC

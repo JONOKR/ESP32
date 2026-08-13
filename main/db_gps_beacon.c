@@ -45,6 +45,10 @@
 #define BEACON_HEARTBEAT_US     1000000  // 1 Hz
 #define BEACON_GPS_RAW_US       1000000  // 1 Hz
 #define BEACON_GPS_CFG_RETRY_US 5000000  // (re)send GPS config every 5 s until PVT flows
+// How many of those retries write the GPS's flash (VALSET layers RAM+BBR+Flash).
+// After this many the retry continues against RAM+BBR only - see
+// db_beacon_send_gps_config for why an unbounded retry must stop touching flash.
+#define BEACON_GPS_CFG_PERSIST_ATTEMPTS 3
 
 // MAVLink identity: beacons take part in the GCS fleet system exactly like
 // drones. Factory-fresh they heartbeat sysid 1 ("unnumbered", same semantics
@@ -199,9 +203,16 @@ void db_gps_beacon_handle_radio(uint8_t *buffer, int bytes_read) {
         memset(&tunnel, 0, sizeof(tunnel));
         uint16_t copy_len = (msg.len < (uint16_t) sizeof(tunnel)) ? msg.len : (uint16_t) sizeof(tunnel);
         memcpy(&tunnel, msg.payload, copy_len);
+        // payload_length is a uint8_t off the wire (up to 255) while the payload
+        // array is 128 bytes, so an oversized value would walk the inner-frame
+        // loop below off the end of the struct and into adjacent stack. The GCS
+        // never builds one that large (build_addressed_payload caps the inner
+        // frame), so anything bigger is malformed - drop it. Same guard as
+        // db_serial.c's ADDRESSED_DATA path.
         if (tunnel.payload_length <= BEACON_MAC_LEN ||
+            (size_t) tunnel.payload_length > sizeof(tunnel.payload) ||
             memcmp(tunnel.payload, LOCAL_MAC_ADDRESS, BEACON_MAC_LEN) != 0) {
-            continue;   // addressed to a different unit
+            continue;   // addressed to a different unit, or a bogus length
         }
         // Parse the inner frame (a complete MAVLink message) and act on it.
         static uint8_t inner_parse_buf[296];
@@ -240,20 +251,44 @@ static void ubx_checksum(const uint8_t *data, uint16_t len, uint8_t *ck_a, uint8
  *   setUART1Output(COM_TYPE_UBX)  -> UBX out on, NMEA out off (UART1)
  *   setAutoPVT(true)              -> NAV-PVT pushed on UART1
  *   setNavigationFrequency(...)   -> CFG-RATE-MEAS
- *   saveConfiguration()           -> persisted (layers RAM+BBR+Flash here)
+ *   saveConfiguration()           -> persisted, but only on the first
+ *                                    BEACON_GPS_CFG_PERSIST_ATTEMPTS calls
  * Sent blind (no ACK handling) and re-sent every BEACON_GPS_CFG_RETRY_US
  * until PVT frames actually flow — so a GPS that boots slower than the ESP32
  * still gets configured, while an already-persisted GPS streams immediately
- * and never triggers a config (no repeated flash writes).
+ * and never triggers a config.
+ *
+ * Only the first BEACON_GPS_CFG_PERSIST_ATTEMPTS calls write the GPS's flash
+ * (layers RAM+BBR+Flash); the retry then continues against RAM+BBR only, so a
+ * miswired or absent GPS cannot turn the unbounded retry into unbounded flash
+ * wear. Consequence: a GPS that takes longer than
+ * BEACON_GPS_CFG_PERSIST_ATTEMPTS * BEACON_GPS_CFG_RETRY_US to accept VALSET
+ * works, but never persists — it reconfigures on every boot. See the body.
  */
 static void db_beacon_send_gps_config(void) {
-    // VALSET payload: version(1)=0, layers(1)=7 (RAM+BBR+Flash), reserved(2), cfgData...
+    // VALSET payload: version(1)=0, layers(1), reserved(2), cfgData...
     //   CFG-UART1OUTPROT-UBX  (0x10740001, L)  = 1
     //   CFG-UART1OUTPROT-NMEA (0x10740002, L)  = 0
     //   CFG-MSGOUT-UBX_NAV_PVT_UART1 (0x20910007, U1) = 1
     //   CFG-RATE-MEAS         (0x30210001, U2) = BEACON_GPS_MEAS_RATE_MS
+    //
+    // The layers byte is the interesting part. Writing layer Flash is what makes
+    // the config survive a power cycle (so the next boot streams PVT immediately
+    // and never reconfigures), but this function is on an unbounded 5 s retry
+    // that only stops once PVT actually flows. A GPS that is miswired, absent,
+    // or NAKs VALSET therefore never stops the retry - and at layers=7 that is
+    // an endless series of flash writes against a part with finite endurance.
+    // So: persist on the first few attempts, then keep retrying against
+    // RAM+BBR only (layers=3). A GPS that is going to accept the config accepts
+    // it in the first few seconds; one that isn't costs nothing but airtime.
+    static uint8_t attempts = 0;
+    const bool persist = attempts < BEACON_GPS_CFG_PERSIST_ATTEMPTS;
+    if (persist) {
+        attempts++;    // only counts up to the threshold, so it cannot wrap
+    }
+    const uint8_t layers = persist ? 0x07 : 0x03;   // RAM+BBR+Flash / RAM+BBR
     uint8_t payload[4 + 5 + 5 + 5 + 6] = {
-            0x00, 0x07, 0x00, 0x00,
+            0x00, layers, 0x00, 0x00,
             0x01, 0x00, 0x74, 0x10, 0x01,
             0x02, 0x00, 0x74, 0x10, 0x00,
             0x07, 0x00, 0x91, 0x20, 0x01,
@@ -371,8 +406,20 @@ static void db_beacon_parse_ubx_byte(uint8_t b) {
 // MAVLink synthesis
 // ---------------------------------------------------------------------------
 
-/** UBX fixType -> MAVLink GPS_FIX_TYPE. */
+/**
+ * UBX fixType -> MAVLink GPS_FIX_TYPE.
+ *
+ * Gated on last_fix.valid (which folds in the receiver's own gnssFixOK flag),
+ * not on fixType alone: the u-blox reports a fixType while explicitly marking
+ * the solution unusable, and GLOBAL_POSITION_INT is already suppressed in that
+ * state. Reporting 3D_FIX alongside a position we refuse to send makes the GCS
+ * show a healthy fix badge for a beacon that is not actually locating itself -
+ * and the follow-the-beacon preflight reads exactly that field.
+ */
 static uint8_t db_beacon_mav_fix_type(void) {
+    if (!last_fix.valid) {
+        return GPS_FIX_TYPE_NO_FIX;
+    }
     switch (last_fix.fix_type) {
         case 2: return GPS_FIX_TYPE_2D_FIX;
         case 3: return GPS_FIX_TYPE_3D_FIX;
