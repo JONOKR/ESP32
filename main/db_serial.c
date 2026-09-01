@@ -37,6 +37,7 @@
 #include "db_protocol.h"
 #include "msp_ltm_serial.h"
 #include "globals.h"
+#include "db_esp_now.h"
 #include "driver/uart.h"
 #include <db_parameters.h>
 
@@ -268,10 +269,45 @@ void db_parse_mavlink_from_radio(int *tcp_clients, udp_conn_list_t *udp_conns, u
     for (int i = 0; i < bytes_read; ++i) {
         fmav_result_t result = {0};
         if (fmav_parse_and_check_to_frame_buf(&result, mav_parser_rx_buf, &fmav_status_radio, buffer[i])) {
-            // Parser detected a full message, write to serial
-            write_to_serial(mav_parser_rx_buf, result.frame_len);
-            // Decode message and react to it if it was for us
+            // Decode the frame first so we can both react to it and detect DroneBridge
+            // fleet-management control frames (MAVLink TUNNEL with a DB payload_type),
+            // which must be consumed here and never forwarded verbatim to the FC.
             fmav_frame_buf_to_msg(&msg, &result, mav_parser_rx_buf);
+            bool db_control_frame = false;
+            if (result.res == FASTMAVLINK_PARSE_RESULT_OK && msg.msgid == FASTMAVLINK_MSG_ID_TUNNEL) {
+                uint16_t db_tunnel_type = fmav_msg_tunnel_get_field_payload_type(&msg);
+                if (db_tunnel_type == DB_ESPNOW_TUNNEL_ADDRESSED_DATA) {
+                    db_control_frame = true;
+                    // payload = [dest_mac(6)][inner MAVLink frame...]. Copy into a zero-filled
+                    // struct so MAVLink v2 trailing-zero truncation is restored correctly.
+                    fmav_tunnel_t db_tunnel;
+                    memset(&db_tunnel, 0, sizeof(db_tunnel));
+                    uint16_t db_copy_len = (msg.len < (uint16_t) sizeof(db_tunnel)) ? msg.len : (uint16_t) sizeof(db_tunnel);
+                    memcpy(&db_tunnel, msg.payload, db_copy_len);
+                    // payload_length is a uint8_t straight off the wire, so it can claim up
+                    // to 255 while the payload array is only 128 bytes. Trusting it would
+                    // read ~127 bytes of adjacent stack and hand them to the flight
+                    // controller as MAVLink. The GCS never builds one larger than the array
+                    // (build_addressed_payload caps the inner frame), so anything bigger is
+                    // malformed by definition - drop the frame rather than clamp it.
+                    if (db_tunnel.payload_length > ESP_NOW_ETH_ALEN &&
+                        (size_t) db_tunnel.payload_length <= sizeof(db_tunnel.payload) &&
+                        memcmp(db_tunnel.payload, LOCAL_MAC_ADDRESS, ESP_NOW_ETH_ALEN) == 0) {
+                        // Addressed to this AIR unit -> deliver the inner frame to our flight controller
+                        write_to_serial(&db_tunnel.payload[ESP_NOW_ETH_ALEN],
+                                        db_tunnel.payload_length - ESP_NOW_ETH_ALEN);
+                    } else {
+                        // addressed to a different drone, or a bogus length -> ignore
+                    }
+                } else if (db_tunnel_type == DB_ESPNOW_TUNNEL_FLEET_LIST) {
+                    db_control_frame = true; // GND->GCS only; never hand it to an FC
+                }
+            }
+            if (!db_control_frame) {
+                // Normal traffic: forward the complete frame to the serial interface (FC or GCS)
+                write_to_serial(mav_parser_rx_buf, result.frame_len);
+            }
+            // React to the message if it was addressed to this ESP32 itself
             if (result.res == FASTMAVLINK_PARSE_RESULT_OK) {
                 db_status_led_mark_radio_rx();
                 if (fmav_msg_is_for_me(db_get_mav_sys_id(), db_get_mav_comp_id(), &msg)) {
@@ -321,14 +357,26 @@ void db_parse_mavlink_from_radio(int *tcp_clients, udp_conn_list_t *udp_conns, u
 void db_read_serial_parse_mavlink(int *tcp_clients, udp_conn_list_t *udp_conns, uint8_t *serial_buffer,
                                   unsigned int *serial_buff_pos) {
     static uint8_t mav_parser_rx_buf[296];  // at least 280 bytes which is the max len for a MAVLink v2 packet
-    uint8_t uart_read_buf[DB_PARAM_SERIAL_PACK_SIZE];
+    // Effective pack size for MAVLink framing. Below one full MAVLink v2 frame
+    // (280 bytes incl. signature) the configured trans_pack_size would force
+    // needless frame splitting, so on WiFi links treat it as lower-bounded.
+    // ESP-NOW is excluded on purpose: there the parameter was pinned to the
+    // radio's payload limit (215) at init and raising it here would only
+    // re-introduce splitting at the radio layer. Runtime-only; the persisted
+    // parameter value is untouched.
+    uint16_t pack_size = DB_PARAM_SERIAL_PACK_SIZE;
+    if (DB_PARAM_RADIO_MODE != DB_WIFI_MODE_ESPNOW_AIR && DB_PARAM_RADIO_MODE != DB_WIFI_MODE_ESPNOW_GND &&
+        pack_size < 280) {
+        pack_size = 280;    // fits any complete MAVLink v2 frame
+    }
+    uint8_t uart_read_buf[pack_size];
     // timeout variables
     static TickType_t last_tick = 0;    // time when we received something from the serial interface for the last time
     static TickType_t current_tick = 0;
     current_tick = xTaskGetTickCount(); // get current time
 
     // Read bytes from serial link (UART or USB/JTAG interface)
-    int bytes_read = db_read_serial(uart_read_buf, DB_PARAM_SERIAL_PACK_SIZE);
+    int bytes_read = db_read_serial(uart_read_buf, pack_size);
 
     if (bytes_read == 0) {
         // did not read anything this cycle -> check serial read timeout
@@ -359,20 +407,20 @@ void db_read_serial_parse_mavlink(int *tcp_clients, udp_conn_list_t *udp_conns, 
             ESP_LOGD(TAG, "Parser detected a full message (%lu total): result.frame_len %i", serial_total_decoded_mav_msgs,
                      result.frame_len);
             // Check if the new message will fit in the buffer
-            if (*serial_buff_pos == 0 && result.frame_len > DB_PARAM_SERIAL_PACK_SIZE) {
-                // frame_len is bigger than DB_PARAM_SERIAL_PACK_SIZE -> Split into multiple messages since
+            if (*serial_buff_pos == 0 && result.frame_len > pack_size) {
+                // frame_len is bigger than pack_size -> Split into multiple messages since
                 // e.g. ESP-NOW can only handle DB_ESPNOW_PAYLOAD_MAXSIZE bytes which is less than MAVLink max msg length
                 uint16_t sent_bytes = 0;
                 uint16_t next_chunk_len = 0;
                 do {
                     next_chunk_len = result.frame_len - sent_bytes;
-                    if (next_chunk_len > DB_PARAM_SERIAL_PACK_SIZE) {
-                        next_chunk_len = DB_PARAM_SERIAL_PACK_SIZE;
+                    if (next_chunk_len > pack_size) {
+                        next_chunk_len = pack_size;
                     } else {}
                     db_send_to_all_clients(tcp_clients, udp_conns, &mav_parser_rx_buf[sent_bytes], next_chunk_len);
                     sent_bytes += next_chunk_len;
                 } while (sent_bytes < result.frame_len);
-            } else if (*serial_buff_pos + result.frame_len > DB_PARAM_SERIAL_PACK_SIZE) {
+            } else if (*serial_buff_pos + result.frame_len > pack_size) {
                 // New message won't fit into the buffer, send buffer first
                 db_send_to_all_clients(tcp_clients, udp_conns, serial_buffer, *serial_buff_pos);
                 *serial_buff_pos = 0;

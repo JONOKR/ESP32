@@ -22,6 +22,7 @@
 #include "db_mavlink_msgs.h"
 #include "db_parameters.h"
 #include "db_serial.h"
+#include "db_esp_now.h"
 #include "globals.h"
 #include "main.h"
 
@@ -83,6 +84,45 @@ uint16_t db_mav_create_heartbeat(uint8_t *buff, fmav_status_t *fmav_status) {
             buff, db_get_mav_sys_id(), db_get_mav_comp_id(),
             MAV_TYPE_ONBOARD_CONTROLLER, MAV_AUTOPILOT_INVALID, MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 0, MAV_STATE_ACTIVE,
             fmav_status);
+}
+
+/**
+ * Builds a DroneBridge "fleet list" message: a MAVLink TUNNEL (payload_type
+ * DB_ESPNOW_TUNNEL_FLEET_LIST) carrying the MAC addresses of all AIR units
+ * the GND is currently hearing from. The GCS uses this to enumerate drones
+ * (and address each one by MAC) even while they all still share MAVLink
+ * system id 1. Only meaningful on the GND, which owns db_esp_now_clients_list.
+ *
+ * Wire payload: [count(1)][mac0(6)][mac1(6)]...  (max 1 + 19*6 = 115 bytes)
+ *
+ * @param buff Output frame buffer (>=296 bytes)
+ * @param fmav_status fastmavlink status struct used for the sequence number
+ * @return length of the encoded frame in buff
+ */
+uint16_t db_mav_create_fleet_list(uint8_t *buff, fmav_status_t *fmav_status) {
+    fmav_tunnel_t tunnel;
+    memset(&tunnel, 0, sizeof(tunnel));
+    tunnel.payload_type = DB_ESPNOW_TUNNEL_FLEET_LIST;
+    tunnel.target_system = 0;       // broadcast - the GCS picks it up by payload_type
+    tunnel.target_component = 0;
+
+    uint8_t count = 0;
+    if (db_esp_now_clients_list != NULL) {
+        count = db_esp_now_clients_list->size;
+        if (count > DB_ESPNOW_MAX_BROADCAST_PEERS) {
+            count = DB_ESPNOW_MAX_BROADCAST_PEERS;
+        }
+    }
+    tunnel.payload[0] = count;
+    for (uint8_t i = 0; i < count; i++) {
+        memcpy(&tunnel.payload[1 + (i * ESP_NOW_ETH_ALEN)],
+               db_esp_now_clients_list->db_esp_now_bpeer_info[i].broadcast_peer_mac,
+               ESP_NOW_ETH_ALEN);
+    }
+    tunnel.payload_length = 1 + (count * ESP_NOW_ETH_ALEN);
+
+    return fmav_msg_tunnel_encode_to_frame_buf(buff, db_get_mav_sys_id(), db_get_mav_comp_id(), &tunnel,
+                                               fmav_status);
 }
 
 /**

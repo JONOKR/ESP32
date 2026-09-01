@@ -46,6 +46,7 @@ extern fmav_status_t fmav_status_serial;    // fmav parser status struct for par
 extern fmav_status_t fmav_status_radio; // fmav parser status struct for parser handling the radio/ESPNOW/WiFi/BLE interface
 
 int open_serial_socket();
+int db_read_serial(uint8_t *uart_read_buf, uint length);
 void write_to_serial(const uint8_t data_buffer[], unsigned int data_length);
 void db_parse_msp_ltm(int tcp_clients[], udp_conn_list_t *udp_connection, uint8_t msp_message_buffer[],
                       unsigned int *serial_read_bytes,
