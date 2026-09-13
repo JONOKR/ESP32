@@ -41,7 +41,14 @@
  * eventually lead to crashes. Stores the new Wi-Fi mode and will be written to the settings. This means it will
  * become active after reboot.
  */
-uint8_t DB_RADIO_MODE_DESIGNATED = DB_WIFI_MODE_AP; // initially assign the same value as DB_RADIO_MODE
+// Must start out matching db_param_radio_mode's default, NOT a hardcoded AP:
+// db_param_write_all_params_nvs() persists THIS variable for the radio mode, and
+// on a factory-fresh unit that write happens (db_read_settings_nvs) before
+// app_main gets a chance to sync the two. Hardcoding AP here silently wrote
+// esp32_mode=1 into the NVS of a role-baked image while every other parameter
+// stored its correct role default - so the unit ran in its role for exactly one
+// boot and came up as a Wi-Fi AP ever after.
+uint8_t DB_RADIO_MODE_DESIGNATED = DB_BUILD_DEFAULT_RADIO_MODE; // initially assign the same value as DB_RADIO_MODE
 
 /* ---------- String based parameters - not available via MAVLink ---------- */
 
@@ -64,8 +71,10 @@ db_parameter_t db_param_radio_mode = {
         },
         .value = {
                 .db_param_u8 = {
-                        .value = DB_WIFI_MODE_AP,
-                        .default_value = DB_WIFI_MODE_AP,
+                        // Role-baked default (see db_parameters.h): stock builds
+                        // boot as WiFi AP, JONOKR role images as ESP-NOW AIR/GND.
+                        .value = DB_BUILD_DEFAULT_RADIO_MODE,
+                        .default_value = DB_BUILD_DEFAULT_RADIO_MODE,
                         .min = DB_WIFI_MODE_AP,
                         .max = DB_WIFI_MODE_END,
                 }
@@ -85,8 +94,10 @@ db_parameter_t db_param_channel = {
         },
         .value = {
                 .db_param_u8 = {
-                        .value = 6,
-                        .default_value = 6,
+                        // Role-baked default (see db_parameters.h). Stock and
+                        // every JONOKR role currently agree on channel 6.
+                        .value = DB_BUILD_DEFAULT_CHANNEL,
+                        .default_value = DB_BUILD_DEFAULT_CHANNEL,
                         .min = 1,
                         .max = 13,
                 }
@@ -130,8 +141,11 @@ db_parameter_t db_param_radio_ant_ext = {
         },
         .value = {
                 .db_param_u8 = {
-                        .value = false,
-                        .default_value = false,
+                        // Role-baked default (see db_parameters.h): JONOKR
+                        // role images (air/gnd/beacon) default to the
+                        // external antenna - they're field/long-range units.
+                        .value = DB_BUILD_DEFAULT_EN_EXT_ANT,
+                        .default_value = DB_BUILD_DEFAULT_EN_EXT_ANT,
                         .min = false,
                         .max = true,
                 }
@@ -151,8 +165,10 @@ db_parameter_t db_param_baud = {
         },
         .value = {
                 .db_param_i32 = {
-                        .value = DB_DEFAULT_UART_BAUD_RATE,
-                        .default_value = DB_DEFAULT_UART_BAUD_RATE,
+                        // Role-baked default (see db_parameters.h): beacon images
+                        // default to 115200 (MicoAir M10 GPS), others to stock.
+                        .value = DB_BUILD_DEFAULT_BAUD,
+                        .default_value = DB_BUILD_DEFAULT_BAUD,
                         .min = 1200,
                         .max = 5000000,
                 }
@@ -172,8 +188,10 @@ db_parameter_t db_param_gpio_tx = {
         },
         .value = {
                 .db_param_u8 = {
-                        .value = DB_DEFAULT_UART_TX_PIN,
-                        .default_value = DB_DEFAULT_UART_TX_PIN,
+                        // Role-baked default (see db_parameters.h): beacon images
+                        // wire the GPS on fixed pins; other builds keep the board default.
+                        .value = DB_BUILD_DEFAULT_GPIO_TX,
+                        .default_value = DB_BUILD_DEFAULT_GPIO_TX,
                         .min = 0,
                         .max = SOC_GPIO_IN_RANGE_MAX,
                 }
@@ -193,8 +211,9 @@ db_parameter_t db_param_gpio_rx = {
         },
         .value = {
                 .db_param_u8 = {
-                        .value = DB_DEFAULT_UART_RX_PIN,
-                        .default_value = DB_DEFAULT_UART_RX_PIN,
+                        // Role-baked default (see db_parameters.h), like gpio_tx above.
+                        .value = DB_BUILD_DEFAULT_GPIO_RX,
+                        .default_value = DB_BUILD_DEFAULT_GPIO_RX,
                         .min = 0,
                         .max = SOC_GPIO_IN_RANGE_MAX,
                 }
@@ -277,10 +296,12 @@ db_parameter_t db_param_proto = {
         },
         .value = {
                 .db_param_u8 = {
-                        .value = DB_SERIAL_PROTOCOL_MAVLINK,
-                        .default_value = DB_SERIAL_PROTOCOL_MAVLINK,
+                        // Role-baked default (see db_parameters.h): beacon images
+                        // boot with the UBX GPS protocol, others with MAVLink.
+                        .value = DB_BUILD_DEFAULT_SERIAL_PROTO,
+                        .default_value = DB_BUILD_DEFAULT_SERIAL_PROTO,
                         .min = DB_SERIAL_PROTOCOL_MSPLTM,
-                        .max = DB_SERIAL_PROTOCOL_TRANSPARENT,
+                        .max = DB_SERIAL_PROTOCOL_UBX_BEACON,
                 }
         }
 };

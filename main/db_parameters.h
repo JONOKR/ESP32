@@ -105,8 +105,43 @@ enum E_DB_WIFI_MODE {
 enum E_DB_SERIAL_PROTOCOL {
     DB_SERIAL_PROTOCOL_MSPLTM = 1,
     DB_SERIAL_PROTOCOL_MAVLINK = 4,
-    DB_SERIAL_PROTOCOL_TRANSPARENT = 5
+    DB_SERIAL_PROTOCOL_TRANSPARENT = 5,
+    // JONOKR beacon/armband role: the UART carries a u-blox GPS instead of a
+    // flight controller; the ESP32 itself synthesizes the MAVLink position
+    // stream. See db_gps_beacon.c.
+    DB_SERIAL_PROTOCOL_UBX_BEACON = 6
 };
+
+/*
+ * Role-baked build defaults (JONOKR provisioning). The flasher GUI builds one
+ * image per unit role (air / ground / beacon) with these overridden on the
+ * compiler command line (see main/CMakeLists.txt + build-fw.ps1 -Role), so a
+ * freshly-flashed (erased) unit boots straight into its role with zero web-UI
+ * configuration. Unset builds keep the stock DroneBridge defaults.
+ */
+#ifndef DB_BUILD_DEFAULT_RADIO_MODE
+#define DB_BUILD_DEFAULT_RADIO_MODE DB_WIFI_MODE_AP
+#endif
+#ifndef DB_BUILD_DEFAULT_SERIAL_PROTO
+#define DB_BUILD_DEFAULT_SERIAL_PROTO DB_SERIAL_PROTOCOL_MAVLINK
+#endif
+#ifndef DB_BUILD_DEFAULT_BAUD
+#define DB_BUILD_DEFAULT_BAUD DB_DEFAULT_UART_BAUD_RATE
+#endif
+#ifndef DB_BUILD_DEFAULT_GPIO_TX
+#define DB_BUILD_DEFAULT_GPIO_TX DB_DEFAULT_UART_TX_PIN
+#endif
+#ifndef DB_BUILD_DEFAULT_GPIO_RX
+#define DB_BUILD_DEFAULT_GPIO_RX DB_DEFAULT_UART_RX_PIN
+#endif
+// Fallbacks match the pre-existing stock defaults in db_parameters.c (channel
+// 6, internal antenna) so a build with no -D DB_ROLE is unchanged.
+#ifndef DB_BUILD_DEFAULT_CHANNEL
+#define DB_BUILD_DEFAULT_CHANNEL 6
+#endif
+#ifndef DB_BUILD_DEFAULT_EN_EXT_ANT
+#define DB_BUILD_DEFAULT_EN_EXT_ANT false
+#endif
 
 typedef struct db_parameter_str_s {
     uint8_t *value;

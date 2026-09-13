@@ -557,8 +557,16 @@ esp_err_t db_espnow_init() {
     memcpy(peer.peer_addr, BROADCAST_MAC, 6);
     if (!esp_now_is_peer_exist(BROADCAST_MAC)) ESP_ERROR_CHECK(esp_now_add_peer(&peer));
 
-    /* Limit payload size to the max we can do */
-    if (DB_PARAM_SERIAL_PACK_SIZE > DB_ESPNOW_PAYLOAD_MAXSIZE || DB_PARAM_SERIAL_PACK_SIZE < 1) {
+    /* Pin the packet size to the ESP-NOW payload limit — in BOTH directions.
+     * Every ESP-NOW frame costs a full airtime slot + AES-GCM overhead + a
+     * send-callback round trip regardless of payload length, so a value BELOW
+     * the limit only fragments the stream (e.g. trans_pack_size=16 would burn
+     * three radio slots on a single 40-byte MAVLink telemetry frame), and a
+     * value above it cannot be carried in one frame anyway. Runtime-only
+     * override: the persisted parameter value is left untouched. */
+    if (DB_PARAM_SERIAL_PACK_SIZE != DB_ESPNOW_PAYLOAD_MAXSIZE) {
+        ESP_LOGI(TAG, "ESP-NOW: overriding trans_pack_size %i -> %i (radio payload limit)",
+                 DB_PARAM_SERIAL_PACK_SIZE, DB_ESPNOW_PAYLOAD_MAXSIZE);
         DB_PARAM_SERIAL_PACK_SIZE = DB_ESPNOW_PAYLOAD_MAXSIZE;
     } else {
         // all good

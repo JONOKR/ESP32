@@ -23,9 +23,15 @@
 
 #include <stdint.h>
 #include <esp_now.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 
 #define DB_ESPNOW_MAX_BROADCAST_PEERS   19 // Number of max. broadcast peers. that we support with internal telemetry. Limit is 255, but this is the max we can fit into one packet 250bytes
-#define ESPNOW_QUEUE_SIZE   6
+// Queue depth for the send / recv-callback / uart-write queues. 12 (up from
+// the original 6) so a telemetry burst or a mission-upload volley rides out a
+// short link fade instead of overflowing and dropping frames (incl. heartbeats).
+// Memory cost is small: 3 queues x 12 slots + <=250 B malloc'd payload each.
+#define ESPNOW_QUEUE_SIZE   12
 #define ESPNOW_MAXDELAY     512
 #define DB_ESPNOW_AES_IV_LEN       12   // 96 bit
 #define DB_ESPNOW_AES_TAG_LEN      16
@@ -50,6 +56,10 @@ typedef struct {
     int8_t gnd_noise_floor;    // noise floor as measured on GND side (not all ESP32s support that feature)
     db_esp_now_bpeer_info_t db_esp_now_bpeer_info[DB_ESPNOW_MAX_BROADCAST_PEERS];
 } __attribute__((__packed__)) db_esp_now_clients_list_t;    // structure is sent as ESP-NOW internal telemetry frame to AIR ESP32
+
+// Local list of known ESP-NOW peers (their MAC + last RSSI/seq). Populated on the GND side.
+// Used by the fleet-list builder to tell the GCS which AIR units are currently connected.
+extern db_esp_now_clients_list_t *db_esp_now_clients_list;
 
 typedef enum {
     DB_ESPNOW_SEND_CB,

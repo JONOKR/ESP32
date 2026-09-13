@@ -118,7 +118,11 @@ void db_timer_start_mavlink_heartbeat() {
  * @param pxTimer
  */
 void db_timer_mavlink_radiostatus_callback(TimerHandle_t pxTimer) {
-    if (DB_PARAM_SERIAL_PROTO != DB_SERIAL_PROTOCOL_MAVLINK) {
+    // The GPS beacon speaks UBX on its serial port but MAVLink on the radio, so
+    // it must report link quality too - otherwise the GCS shows a beacon with no
+    // signal strength at all. Every other non-MAVLink protocol stays excluded.
+    if (DB_PARAM_SERIAL_PROTO != DB_SERIAL_PROTOCOL_MAVLINK &&
+        DB_PARAM_SERIAL_PROTO != DB_SERIAL_PROTOCOL_UBX_BEACON) {
         return; // Do not send heartbeat in transparent mode
     }
     static uint8_t buff[296];
@@ -173,6 +177,50 @@ void db_timer_start_mavlink_radio_status() {
     if (xRadioStatusTimerHandle != NULL) {
         ESP_LOGI(TAG, "Starting to send radio status packets.");
         xTimerStart(xRadioStatusTimerHandle, 0);
+    }
+}
+
+/**
+ * Timer callback that, on the ESP-NOW GND, emits a DroneBridge fleet-list
+ * TUNNEL to the GCS over the serial link. Lets the GCS enumerate connected
+ * AIR units by MAC (for automatic system-id assignment) even while every
+ * flight controller still reports system id 1. No-op in every other role.
+ * @param pxTimer
+ */
+void db_timer_mavlink_fleet_list_callback(TimerHandle_t pxTimer) {
+    if (DB_PARAM_SERIAL_PROTO != DB_SERIAL_PROTOCOL_MAVLINK) {
+        return; // fleet list rides MAVLink TUNNEL - only relevant in MAVLink mode
+    }
+    if (DB_PARAM_RADIO_MODE != DB_WIFI_MODE_ESPNOW_GND) {
+        return; // only the GND knows the full set of connected AIR units
+    }
+    static uint8_t buff[296];
+    uint16_t len = db_mav_create_fleet_list(buff, &fmav_status_serial);
+    if (len > 0) {
+        write_to_serial(buff, len);
+    }
+}
+
+/**
+ * Starts a periodic timer that emits the fleet-list TUNNEL. Safe to start in
+ * any role - the callback self-gates to the ESP-NOW GND.
+ */
+void db_timer_start_mavlink_fleet_list() {
+    static TimerHandle_t xFleetListTimerHandle;
+    xFleetListTimerHandle = xTimerCreate(
+            "MAV_FleetList_Timer",
+            pdMS_TO_TICKS(DB_TIMER_MAVLINK_FLEET_LIST_MS),
+            pdTRUE,
+            (void *) 0,
+            db_timer_mavlink_fleet_list_callback
+    );
+
+    if (xFleetListTimerHandle == NULL) {
+        ESP_LOGE(TAG, "Failed to create fleet list timer.");
+    }
+    if (xFleetListTimerHandle != NULL) {
+        ESP_LOGI(TAG, "Starting to send fleet list packets.");
+        xTimerStart(xFleetListTimerHandle, 0);
     }
 }
 

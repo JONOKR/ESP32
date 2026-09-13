@@ -79,12 +79,12 @@ function change_msp_ltm_visibility(){
 	let telem_proto = document.getElementById("proto");
 	if (telem_proto.value === "1") {
 		msp_ltm_div.style.display = "block";
-		trans_pack_size_div.style.display = "none";
-
 	} else {
 		msp_ltm_div.style.display = "none";
-		trans_pack_size_div.style.display = "block";
 	}
+	// trans_pack_size stays hidden always (JONOKR): the firmware pins/bounds
+	// the packet size itself at boot, so the setting is no longer user-facing.
+	trans_pack_size_div.style.display = "none";
 	if (telem_proto.value === "4") {
 		rep_rssi_dbm_div.style.display = "block";
 	} else {

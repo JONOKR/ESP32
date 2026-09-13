@@ -473,6 +473,14 @@ void db_init_wifi_espnow() {
     ESP_ERROR_CHECK(esp_wifi_start());
     ESP_ERROR_CHECK(esp_wifi_set_channel(DB_PARAM_CHANNEL, WIFI_SECOND_CHAN_NONE));
     ESP_ERROR_CHECK(esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_LR));
+    // Explicitly request maximum TX power (units of 0.25 dBm -> 80 = 20 dBm, the
+    // EU 2.4 GHz EIRP limit and this build's CONFIG_ESP_PHY_MAX_WIFI_TX_POWER).
+    // The driver clamps to the PHY calibration limit; being explicit protects
+    // range against a lower sdkconfig default or an IDF default change.
+    esp_err_t tx_pwr_err = esp_wifi_set_max_tx_power(80);
+    if (tx_pwr_err != ESP_OK) {
+        ESP_LOGW(TAG, "esp_wifi_set_max_tx_power(80) failed: %s", esp_err_to_name(tx_pwr_err));
+    }
     ESP_LOGI(TAG, "Enabled ESP-NOW WiFi Mode! LR Mode is set. This device will be invisible to non-ESP32 devices!");
     ESP_ERROR_CHECK(esp_read_mac(LOCAL_MAC_ADDRESS, ESP_MAC_WIFI_STA));
 }
@@ -575,6 +583,14 @@ void db_read_settings_nvs() {
 
         // Set all parameters to their default values when flash is empty
         db_param_reset_all();
+
+        // The radio mode is persisted from DB_RADIO_MODE_DESIGNATED rather than
+        // from the parameter itself (see db_param_write_all_params_nvs), so it
+        // has to be re-synced here or this very first write stores a stale mode
+        // and the role-baked default is lost on the next boot. Deliberately NOT
+        // folded into db_param_reset_all(): the reset-button handlers set
+        // DESIGNATED to AP on purpose, as the escape hatch back to the web UI.
+        DB_RADIO_MODE_DESIGNATED = DB_PARAM_RADIO_MODE;
 
         // Now save these defaults to NVS
         db_write_settings_to_nvs();
@@ -685,7 +701,27 @@ void db_jtag_serial_info_print() {
  * Must be called before radio/Wi-Fi gets initialized!
  */
 void db_configure_antenna() {
-#if defined(CONFIG_DB_HAS_RF_SWITCH) && defined(CONFIG_DB_RF_SWITCH_GPIO) && (CONFIG_DB_RF_SWITCH_GPIO != 0)
+#if defined(DB_BUILD_RF_SWITCH_GPIO)
+    /* JONOKR role images build against the *generic* board profile, so the stock
+     * CONFIG_DB_HAS_RF_SWITCH path below is compiled out entirely and the
+     * ant_use_ext parameter drove nothing at all - it stored 1 and the board
+     * quietly kept transmitting on its onboard antenna. Drive the switch from
+     * the role build instead, so the setting is real without having to adopt a
+     * board profile whose UART pins are wrong for us.
+     *
+     * Seeed XIAO ESP32-C6: GPIO3 enables the RF switch (active LOW) and GPIO14
+     * selects the path - HIGH = external u.FL, LOW = onboard ceramic. Boards
+     * with only a u.FL connector (XIAO C3/S3) have no switch, so no GPIOs are
+     * defined for them and this whole block disappears. */
+#if defined(DB_BUILD_RF_SWITCH_EN_GPIO)
+    gpio_set_direction(DB_BUILD_RF_SWITCH_EN_GPIO, GPIO_MODE_OUTPUT);
+    gpio_set_level(DB_BUILD_RF_SWITCH_EN_GPIO, 0);   // active low: powers the switch
+#endif
+    gpio_set_direction(DB_BUILD_RF_SWITCH_GPIO, GPIO_MODE_OUTPUT);
+    gpio_set_level(DB_BUILD_RF_SWITCH_GPIO, DB_PARAM_EN_EXT_ANT);
+    ESP_LOGI(TAG, "RF switch on GPIO %i set to %s antenna", DB_BUILD_RF_SWITCH_GPIO,
+             DB_PARAM_EN_EXT_ANT ? "EXTERNAL" : "onboard");
+#elif defined(CONFIG_DB_HAS_RF_SWITCH) && defined(CONFIG_DB_RF_SWITCH_GPIO) && (CONFIG_DB_RF_SWITCH_GPIO != 0)
 #ifdef CONFIG_DB_OFFICIAL_BOARD_1_X_C6
     gpio_set_direction(GPIO_NUM_3, GPIO_MODE_OUTPUT);
     gpio_set_level(GPIO_NUM_3, 0); // set to low to enable RF switching
@@ -710,6 +746,12 @@ void app_main() {
     ESP_ERROR_CHECK(ret);
     db_read_settings_nvs();
     DB_RADIO_MODE_DESIGNATED = DB_PARAM_RADIO_MODE; // must always match, mismatch only allowed when changed by user action and not rebooted, yet.
+    // Resolved boot config, straight from a serial monitor: makes it
+    // immediately obvious whether a role-baked build's defaults actually
+    // took effect (vs. NVS holding a stale/prior value, or a stale build).
+    ESP_LOGI(TAG, "Boot config: radio_mode=%i serial_proto=%i baud=%li chan=%i ext_ant=%i",
+             DB_PARAM_RADIO_MODE, DB_PARAM_SERIAL_PROTO, (long) DB_PARAM_SERIAL_BAUD,
+             DB_PARAM_CHANNEL, DB_PARAM_EN_EXT_ANT);
     set_reset_trigger();
     db_configure_antenna();
     db_status_led_init();
@@ -756,6 +798,7 @@ void app_main() {
 
     db_timer_start_mavlink_heartbeat();
     db_timer_start_mavlink_radio_status();
+    db_timer_start_mavlink_fleet_list();
     db_timer_start_status_led();
 
     if (DB_PARAM_RADIO_MODE != DB_WIFI_MODE_ESPNOW_AIR && DB_PARAM_RADIO_MODE != DB_WIFI_MODE_ESPNOW_GND &&
