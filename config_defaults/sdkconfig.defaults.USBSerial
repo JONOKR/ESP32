@@ -5,10 +5,6 @@ CONFIG_APP_RETRIEVE_LEN_ELF_SHA=16
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_DB_SERIAL_OPTION_JTAG=y
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
-CONFIG_BT_ENABLED=y
-CONFIG_BT_NIMBLE_ENABLED=y
-CONFIG_BT_NIMBLE_LOG_LEVEL_ERROR=y
-CONFIG_BT_NIMBLE_NVS_PERSIST=y
 CONFIG_ETH_USE_SPI_ETHERNET=n
 CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
 CONFIG_PM_POWER_DOWN_CPU_IN_LIGHT_SLEEP=n
@@ -25,3 +21,20 @@ CONFIG_LWIP_TCP_WND_DEFAULT=5744
 CONFIG_MQTT_PROTOCOL_311=n
 CONFIG_MQTT_TRANSPORT_SSL=n
 CONFIG_WS_TRANSPORT=n
+# Bluetooth off (JONOKR). Upstream DroneBridge builds the NimBLE stack in for
+# radio mode 6 (DB_BLUETOOTH_MODE, a BLE serial profile). JONOKR units are
+# role-baked to ESP-NOW (mode 4/5), and mode 6 is mutually exclusive with
+# ESP-NOW - selecting it would drop the drone link - so that code can never
+# run on these units.
+#
+# It is not small. Measured from the 2026-11-07 map files, dropping it saves
+# roughly 366 KB on the esp32c6 (libble_app.a 237 KB + libbt.a 129 KB),
+# 243 KB on the c3 and 211 KB on the s3. The c6 had been at 5 % free in its
+# app partition; this is what put it back to a comfortable margin, instead of
+# widening the partition table.
+#
+# Safe to switch off without touching code: main/CMakeLists.txt only compiles
+# db_ble.c when CONFIG_BT_ENABLED, every call site is #ifdef-guarded, and
+# main.c falls back to AP mode with an explicit log if mode 6 is ever
+# selected. The web UI still lists the mode; picking it just lands in AP mode.
+CONFIG_BT_ENABLED=n

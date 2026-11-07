@@ -503,15 +503,23 @@ void db_set_radio_status(uint8_t enable_wifi) {
             esp_restart(); // enable Wi-Fi/BLE by restarting ESP32 - an easy way to make sure all things are set up right
         } else if (!enable_wifi && !DB_RADIO_IS_OFF) {
             ESP_LOGI(TAG, "Disabling Wi-Fi/BLE");
+            /* The whole BLE test compiles out without CONFIG_BT_ENABLED, not
+             * just the db_ble_deinit() call: if the test were left in, a
+             * Bluetooth-less build would take this branch and set
+             * DB_RADIO_IS_OFF without stopping anything, reporting the radio
+             * as off while Wi-Fi kept transmitting. Unreachable today - with
+             * Bluetooth off, app_main forces the mode back to AP - but not a
+             * state worth leaving reachable by accident. */
+#ifdef CONFIG_BT_ENABLED
             if (DB_PARAM_RADIO_MODE == DB_BLUETOOTH_MODE) {
                 db_ble_deinit();    // disable BLE
                 DB_RADIO_IS_OFF = true;
+            } else
+#endif
+            if (esp_wifi_stop() == ESP_OK) { // disable WiFi
+                DB_RADIO_IS_OFF = true;
             } else {
-                if (esp_wifi_stop() == ESP_OK) { // disable WiFi
-                    DB_RADIO_IS_OFF = true;
-                } else {
-                    ESP_LOGW(TAG, "db_set_radio_status tried to disable Wi-Fi. FAILED");
-                }
+                ESP_LOGW(TAG, "db_set_radio_status tried to disable Wi-Fi. FAILED");
             }
         }
     } else {
