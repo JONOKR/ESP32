@@ -61,6 +61,12 @@ typedef struct {
 // Used by the fleet-list builder to tell the GCS which AIR units are currently connected.
 extern db_esp_now_clients_list_t *db_esp_now_clients_list;
 
+/**
+ * MAC address to send the next ESP-NOW packet to, or NULL for broadcast.
+ * See the implementation for why this is a single peer only.
+ */
+const uint8_t *db_espnow_unicast_target();
+
 typedef enum {
     DB_ESPNOW_SEND_CB,
     DB_ESPNOW_RECV_CB,
