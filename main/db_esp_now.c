@@ -194,12 +194,7 @@ bool db_espnow_encrypt_auth_send(db_esp_now_packet_t *db_esp_now_packet, const u
     // const uint8_t payload_length = db_esp_now_packet->db_esp_now_packet_protected_data.payload_length_decrypted;
     ret = db_encrypt_payload(db_esp_now_packet, db_esp_now_packet->db_esp_now_packet_protected_data.payload_length_decrypted + 1);
     if (ret == 0) {
-        /* Addressed to the peer when we have exactly one, so the WiFi MAC
-         * acknowledges and retransmits it; broadcast otherwise. See
-         * db_espnow_unicast_target(). */
-        const uint8_t *dest = db_espnow_unicast_target();
-        if (dest == NULL) dest = BROADCAST_MAC;
-        err = esp_now_send(dest, (const uint8_t *) db_esp_now_packet, (db_esp_now_packet_header_len + DB_ESPNOW_AES_TAG_LEN + payload_length + 1));
+        err = esp_now_send(BROADCAST_MAC, (const uint8_t *) db_esp_now_packet, (db_esp_now_packet_header_len + DB_ESPNOW_AES_TAG_LEN + payload_length + 1));
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "Error (%s) sending ESP-NOW data - size %i !", esp_err_to_name(err), (db_esp_now_packet_header_len + DB_ESPNOW_AES_TAG_LEN + payload_length + 1));
             return false;
@@ -213,8 +208,7 @@ bool db_espnow_encrypt_auth_send(db_esp_now_packet_t *db_esp_now_packet, const u
 }
 
 /**
- * Tries to read one entry from the ESP-NOW send queue (mainly filled by the UART task) and sends the data to the
- * single known peer, or by broadcast when there is not exactly one (see db_espnow_unicast_target()).
+ * Tries to read one entry from the ESP-NOW send queue (mainly filled by the UART task) and sends the data via broadcast.
  * Only call this function when the last ESP-NOW send callback has returned! Otherwise order of packets is not guaranteed
  *
  * @return false if no packet was sent, true if packet was sent (actual sending will be confirmed by the send-callback)
@@ -258,85 +252,6 @@ bool db_read_uart_queue_and_send() {
 }
 
 /**
- * Register a peer with ESP-NOW so packets can be addressed to it directly.
- *
- * Unencrypted at the ESP-NOW layer on purpose: DroneBridge already encrypts
- * and authenticates every payload itself (AES-GCM), and ESP-NOW's limit on
- * *encrypted* peers is far lower than its 20-peer total, which a fleet would
- * run into.
- *
- * @param peer_mac MAC address of the peer to register
- * @return true if the peer is registered (or already was), false on error
- */
-static bool db_espnow_register_unicast_peer(const uint8_t peer_mac[ESP_NOW_ETH_ALEN]) {
-    if (esp_now_is_peer_exist(peer_mac)) {
-        return true;
-    }
-    esp_now_peer_info_t peer = {0};
-    memcpy(peer.peer_addr, peer_mac, ESP_NOW_ETH_ALEN);
-    peer.ifidx = WIFI_IF_STA;   // ESP-NOW modes run the radio in STA mode
-    peer.encrypt = false;       // payload is already encrypted by DroneBridge
-    const esp_err_t err = esp_now_add_peer(&peer);
-    if (err != ESP_OK) {
-        /* Not fatal: db_espnow_unicast_target() only offers a peer that is
-         * registered, so sending falls back to broadcast. */
-        ESP_LOGW(TAG, "Could not add ESP-NOW peer %02x:%02x:%02x:%02x:%02x:%02x (%s) - "
-                      "staying on broadcast for it",
-                 peer_mac[0], peer_mac[1], peer_mac[2], peer_mac[3], peer_mac[4], peer_mac[5],
-                 esp_err_to_name(err));
-        return false;
-    }
-    ESP_LOGI(TAG, "ESP-NOW peer %02x:%02x:%02x:%02x:%02x:%02x registered for direct (unicast) sending",
-             peer_mac[0], peer_mac[1], peer_mac[2], peer_mac[3], peer_mac[4], peer_mac[5]);
-    return true;
-}
-
-/**
- * MAC address to send the next ESP-NOW packet to, or NULL to broadcast it.
- *
- * **Why this matters more than anything else about the link.** 802.11 never
- * acknowledges a group-addressed frame, so a broadcast ESP-NOW packet is
- * transmitted exactly once and a lost one is lost for good. Addressed to a
- * peer, the WiFi MAC acknowledges and retransmits it by itself, and the
- * send-callback status then means *delivered* rather than merely *radiated*.
- *
- * This firmware broadcast everything until 2026-11-07, and nothing above it
- * retries either - MAVLink has no ARQ. On 2026-11-01 that cost two flights'
- * worth of debugging: a single dropped MISSION_ACK failed a mission upload
- * that had in fact completed, and a single dropped COMMAND_ACK made the GCS
- * declare MISSION_START rejected and pull a flying aircraft out of AUTO. The
- * link was running at about a tenth of its measured capacity at the time, so
- * no amount of extra bandwidth would have helped; retransmission would have.
- *
- * **Only with exactly one peer.** Two reasons, both deliberate:
- *   - the send path is single-flight by design (`ready_to_send` waits for the
- *     send callback so packet order is preserved), and one payload must
- *     therefore remain one esp_now_send() call;
- *   - with several AIR units a broadcast reaches all of them in one airtime
- *     slot, where N unicasts cost N slots on a link whose goodput the whole
- *     fleet shares.
- * A fleet therefore keeps the old behaviour. Making a fleet reliable needs
- * per-peer queues, which is a larger change than this one.
- *
- * Both roles populate the peer list from received packets (update_peer_list
- * is called on the GND and AIR sides alike), so the GND learns its one AIR
- * unit and an AIR unit learns its GND station. With no peer yet - before the
- * first packet arrives - this returns NULL and discovery happens by broadcast
- * as before.
- *
- * @return pointer to the peer's MAC, or NULL if the packet should be broadcast
- */
-const uint8_t *db_espnow_unicast_target() {
-    if (db_esp_now_clients_list == NULL || db_esp_now_clients_list->size != 1) {
-        return NULL;
-    }
-    const uint8_t *mac = db_esp_now_clients_list->db_esp_now_bpeer_info[0].broadcast_peer_mac;
-    /* Registration can have failed (peer table full, ESP-NOW not ready when
-     * the peer was first seen); broadcast is the honest fallback. */
-    return esp_now_is_peer_exist(mac) ? mac : NULL;
-}
-
-/**
  * Add a new ESP-NOW broadcast peer to the list of known ESP-NOW peers. Checks if peer is already known based on MAC.
  * List is then used to keep track of the RSSI, packet loss and signal quality on GND side.
  *
@@ -362,13 +277,6 @@ int16_t update_peer_list(db_esp_now_clients_list_t *esp_now_clients, uint8_t bro
         memcpy(db_esp_now_bpeer_info.broadcast_peer_mac, broadcast_peer_mac, ESP_NOW_ETH_ALEN);
         esp_now_clients->db_esp_now_bpeer_info[esp_now_clients->size] = db_esp_now_bpeer_info;
         esp_now_clients->size++; // Increment the size of the list
-        /* Register the peer with ESP-NOW as well, so packets can be addressed
-         * to it directly instead of broadcast - see db_espnow_unicast_target().
-         * No encryption flag: DroneBridge encrypts the payload itself with
-         * AES-GCM, which also keeps us clear of ESP-NOW's much lower limit on
-         * encrypted peers. Failure is not fatal; sending falls back to
-         * broadcast, which is what the firmware did until 2026-11-07. */
-        db_espnow_register_unicast_peer(broadcast_peer_mac);
         return (esp_now_clients->size-1) ;
     }
 }
