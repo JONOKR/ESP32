@@ -23,14 +23,16 @@
 
 #include <stdint.h>
 #include <esp_now.h>
+#include "db_espnow_limits.h"   // DB_ESPNOW_MAX_BROADCAST_PEERS (19), upstream since v2.4.0
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 
-#define DB_ESPNOW_MAX_BROADCAST_PEERS   19 // Number of max. broadcast peers. that we support with internal telemetry. Limit is 255, but this is the max we can fit into one packet 250bytes
-// Queue depth for the send / recv-callback / uart-write queues. 12 (up from
-// the original 6) so a telemetry burst or a mission-upload volley rides out a
-// short link fade instead of overflowing and dropping frames (incl. heartbeats).
-// Memory cost is small: 3 queues x 12 slots + <=250 B malloc'd payload each.
+// Queue depth for the send / recv-callback / uart-write queues. 12, up from
+// upstream's 6, so a telemetry burst or a mission-upload volley rides out a
+// short link fade instead of overflowing and dropping frames (incl.
+// heartbeats). Memory cost is small: 3 queues x 12 slots + <=250 B malloc'd
+// payload each. Kept through the v2.4.1 merge on purpose - this link has no
+// retransmission, so an overflow is an unrecoverable loss (memory.md 5.0).
 #define ESPNOW_QUEUE_SIZE   12
 #define ESPNOW_MAXDELAY     512
 #define DB_ESPNOW_AES_IV_LEN       12   // 96 bit
@@ -59,7 +61,20 @@ typedef struct {
 
 // Local list of known ESP-NOW peers (their MAC + last RSSI/seq). Populated on the GND side.
 // Used by the fleet-list builder to tell the GCS which AIR units are currently connected.
-extern db_esp_now_clients_list_t *db_esp_now_clients_list;
+/**
+ * Read-only view of the ESP-NOW peer list, for building the fleet-list TUNNEL.
+ *
+ * Upstream made the list itself file-local in v2.4.1 and dropped the `extern`
+ * that used to be here. JONOKR's fleet addressing still needs to read it
+ * (db_mav_create_fleet_list), so it goes through this accessor instead of
+ * re-exporting the global - the dependency stays explicit and upstream's
+ * encapsulation survives the next merge.
+ *
+ * Only populated on the GND, which is the side that tracks peers.
+ *
+ * @return pointer to the peer list, or NULL before ESP-NOW is initialised
+ */
+const db_esp_now_clients_list_t *db_espnow_peer_list(void);
 
 typedef enum {
     DB_ESPNOW_SEND_CB,
@@ -74,6 +89,7 @@ typedef struct {
 typedef struct {
     uint8_t mac_addr[ESP_NOW_ETH_ALEN];
     int8_t rssi;
+    int8_t noise_floor;
     uint8_t data_len;
     uint8_t *data;
 } db_espnow_event_recv_cb_t;
@@ -94,12 +110,21 @@ typedef enum {
     DB_ESP_NOW_PACKET_TYPE_INTERNAL_TELEMETRY = 1,
 } db_espnow_queue_event_type_t;
 
-/* Element of db_espnow_send_queue and db_uart_write_queue */
+/* Element of db_espnow_send_queue. */
 typedef struct {
     uint8_t data_len;
     uint8_t *data;
     db_espnow_queue_event_type_t packet_type;   // only relevant when reading queue that sends via ESP-NOW
 } __attribute__((__packed__)) db_espnow_queue_event_t;
+
+/** Element of db_uart_write_queue, including the source stream identity. */
+typedef struct {
+    uint8_t data_len;
+    uint8_t *data;
+    uint8_t source_mac[ESP_NOW_ETH_ALEN];
+    uint32_t seq_num;
+    uint8_t origin;
+} db_espnow_uart_queue_event_t;
 
 enum {
     DB_ESPNOW_ORIGIN_GND = 0,

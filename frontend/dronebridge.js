@@ -1,7 +1,11 @@
 const ROOT_URL = window.location.href       // for production code
 // const ROOT_URL = "http://localhost:3000/"   // for testing with local json server
 let conn_status = 0;		// connection status to the ESP32
-let old_conn_status = 0;	// connection status before last update of UI to know when it changed
+let conn_status_initialized = false;
+let stats_request_in_flight = false;
+let static_refresh_in_flight = null;
+let static_data_ready = false;
+let initial_static_retry_used = false;
 let serial_via_JTAG = 0;	// set to 1 if ESP32 is using the USB interface as serial interface for data and not using the UART. If 0 we set UART config to invisible for the user.
 let last_byte_count = 0;
 let last_timestamp_byte_count = 0;
@@ -31,6 +35,8 @@ function change_ap_ip_visibility() {
 		wifi_en_gn_div: document.getElementById("wifi_en_gn_div"),
 		static_ip_config_div: document.getElementById("static_ip_config_div"),
 		pass_div: document.getElementById("pass_div"),
+		espnow_secret_div: document.getElementById("espnow_secret_div"),
+		espnow_rotate_secret_button: document.getElementById("espnow_rotate_secret_button"),
 	};
 
 	if (esp32Mode === "2") {
@@ -66,10 +72,25 @@ function change_ap_ip_visibility() {
 	if (esp32Mode > "3" && esp32Mode < "6") {
 		elements.ap_ip_div.style.display = "none";
 		elements.wifi_ssid_div.style.visibility = "hidden";
+		elements.espnow_secret_div.style.display = "block";
+		elements.espnow_rotate_secret_button.style.display = esp32Mode === "5" ? "inline-block" : "none";
 	} else {
 		elements.wifi_ssid_div.style.visibility = "visible";
+		elements.espnow_secret_div.style.display = "none";
+		elements.espnow_rotate_secret_button.style.display = "none";
 	}
 	change_radio_dis_arm_visibility();
+	change_espnow_air2air_visibility();
+}
+
+/**
+ * Shows AIR-to-AIR MAVLink forwarding only where it can safely apply.
+ */
+function change_espnow_air2air_visibility() {
+	const espnow_air2air_div = document.getElementById("espnow_air2air_div");
+	const esp32_mode = document.getElementById("esp32_mode");
+	const telemetry_protocol = document.getElementById("proto");
+	espnow_air2air_div.style.display = esp32_mode.value === "4" && telemetry_protocol.value === "4" ? "block" : "none";
 }
 
 function change_msp_ltm_visibility(){
@@ -91,6 +112,7 @@ function change_msp_ltm_visibility(){
 		rep_rssi_dbm_div.style.display = "none";
 	}
 	change_radio_dis_arm_visibility();
+	change_espnow_air2air_visibility();
 }
 
 function change_uart_visibility() {
@@ -169,15 +191,34 @@ async function get_json(api_path) {
 	const timeout = setTimeout(() => {
 		controller.abort()
 	}, 1000)
-	const response = await fetch(req_url, {
-		signal: controller.signal
-	});
-	if (!response.ok) {
-		const message = `An error has occured: ${response.status}`;
-		conn_status = 0
-		throw new Error(message);
+	try {
+		const response = await fetch(req_url, {
+			signal: controller.signal
+		});
+		if (!response.ok) {
+			const message = `An error has occured: ${response.status}`;
+			throw new Error(message);
+		}
+		return await response.json();
+	} finally {
+		clearTimeout(timeout);
 	}
-	return await response.json();
+}
+
+/**
+ * Rotates the ESP-NOW group secret after warning that every AIR unit must be rebound.
+ */
+async function rotate_espnow_secret() {
+	if (!confirm("Rotate the ESP-NOW link secret? All currently bound AIR units will disconnect and must be rebound.")) {
+		return;
+	}
+	try {
+		const response = await send_json("api/settings/espnow-secret/rotate");
+		document.getElementById("espnow_secret").value = response.espnow_secret;
+		show_toast(response.msg);
+	} catch (error) {
+		show_toast(error.message);
+	}
 }
 
 /**
@@ -198,7 +239,6 @@ async function send_json(api_path, json_data = undefined) {
 		body: json_data
 	});
 	if (!response.ok) {
-		conn_status = 0
 		const message = `An error has occured: ${response.status}`;
 		throw new Error(message);
 	}
@@ -225,9 +265,14 @@ function get_esp_chip_model_str(esp_model_index) {
 	}
 }
 
-function get_system_info() {
-	get_json("api/system/info").then(json_data => {
-		console.log("Received settings: " + json_data)
+/**
+ * Fetch system information and apply it to the user interface.
+ * @returns {Promise<boolean>} True when the response was applied successfully
+ */
+async function get_system_info() {
+	try {
+		const json_data = await get_json("api/system/info");
+		console.log("Received system info: " + json_data)
 		document.getElementById("about").innerHTML = "DroneBridge for ESP32 v" + json_data["major_version"] +
 			"." + json_data["minor_version"] + "." + json_data["patch_version"] + " ("+json_data["maturity_version"]+")" +
 			" - esp-idf " + json_data["idf_version"] + " - " + get_esp_chip_model_str(json_data["esp_chip_model"])
@@ -239,14 +284,76 @@ function get_system_info() {
 		} else {
 			document.getElementById("ant_use_ext_div").style.display = "none";
 		}
-	}).catch(error => {
-		conn_status = 0
-		error.message;
-		return -1;
-	});
-	return 0;
+		return true;
+	} catch (error) {
+		console.error("Failed to load or display system information:", error);
+		return false;
+	}
 }
 
+/**
+ * Retry the initial static data request once after stats confirms connectivity.
+ */
+function retry_initial_static_data_if_needed() {
+	if (conn_status === 1 && !static_data_ready && static_refresh_in_flight === null && !initial_static_retry_used) {
+		initial_static_retry_used = true;
+		refresh_static_data();
+	}
+}
+
+/**
+ * Fetch system information and settings without allowing overlapping refreshes.
+ * @returns {Promise<boolean>} True when both responses were applied successfully
+ */
+function refresh_static_data() {
+	if (static_refresh_in_flight !== null) {
+		return static_refresh_in_flight;
+	}
+
+	static_refresh_in_flight = Promise.all([get_system_info(), get_settings()])
+		.then(results => {
+			const refresh_succeeded = results.every(result => result === true);
+			if (refresh_succeeded) {
+				static_data_ready = true;
+				check_for_issues();
+			}
+			return refresh_succeeded;
+		})
+		.finally(() => {
+			static_refresh_in_flight = null;
+			setTimeout(retry_initial_static_data_if_needed, 0);
+		});
+
+	return static_refresh_in_flight;
+}
+
+/**
+ * Record connectivity reported by stats polling and refresh static data after reconnecting.
+ * @param {boolean} is_connected True when the latest stats request succeeded
+ */
+function set_connection_status(is_connected) {
+	const new_status = is_connected ? 1 : 0;
+	const previous_status = conn_status;
+	const was_initialized = conn_status_initialized;
+
+	conn_status = new_status;
+	conn_status_initialized = true;
+
+	if (!was_initialized) {
+		if (new_status === 1) {
+			retry_initial_static_data_if_needed();
+		}
+		return;
+	}
+
+	if (previous_status === 0 && new_status === 1) {
+		refresh_static_data();
+	}
+}
+
+/**
+ * Update the ESP32 connection indicator.
+ */
 function update_conn_status() {
 	if (conn_status)
 		document.getElementById("web_conn_status").innerHTML = "<span class=\"dot_green\"></span> connected to ESP32"
@@ -254,23 +361,29 @@ function update_conn_status() {
 		document.getElementById("web_conn_status").innerHTML = "<span class=\"dot_red\"></span> disconnected from ESP32"
 		document.getElementById("current_client_ip").innerHTML = ""
 	}
-	if (conn_status !== old_conn_status) {
-		// connection status changed. Update settings and UI
-		get_system_info();
-		get_settings();
-		setTimeout(change_msp_ltm_visibility, 500);
-		setTimeout(change_ap_ip_visibility, 500);
-		setTimeout(change_uart_visibility, 500);
-	}
-	old_conn_status = conn_status
 }
 
 /**
  * Get connection status information and display it in the GUI
  */
-function get_stats() {
-	get_json("api/system/stats").then(json_data => {
-		conn_status = 1
+async function get_stats() {
+	if (stats_request_in_flight) {
+		return;
+	}
+
+	stats_request_in_flight = true;
+	try {
+		let json_data;
+		try {
+			json_data = await get_json("api/system/stats");
+			set_connection_status(true);
+		} catch (error) {
+			set_connection_status(false);
+			console.warn("Failed to fetch system statistics:", error);
+			return;
+		}
+
+		try {
 		let d = new Date();
 		recv_ser_bytes = parseInt(json_data["read_bytes"]);
 		serial_dec_mav_msgs = parseInt(json_data["serial_dec_mav_msgs"]);
@@ -334,20 +447,22 @@ function get_stats() {
 			document.getElementById("current_client_ip").innerHTML = a
 		}
 
-	}).catch(error => {
-		conn_status = 0
-		error.message;
-	});
+		} catch (error) {
+			console.error("Failed to display system statistics:", error);
+		}
+	} finally {
+		stats_request_in_flight = false;
+	}
 }
 
 /**
  * Get settings from ESP and display them in the GUI. JSON objects have to match the element ids
- *  returns 0 on success and -1 on failure
+ * @returns {Promise<boolean>} True when the response was applied successfully
  */
-function get_settings() {
-	get_json("api/settings").then(json_data => {
+async function get_settings() {
+	try {
+		const json_data = await get_json("api/settings");
 		console.log("Received settings: " + json_data)
-		conn_status = 1
 		for (const key in json_data) {
 			if (json_data.hasOwnProperty(key)) {
 				let elem = document.getElementById(key)
@@ -362,15 +477,15 @@ function get_settings() {
 			}
 		}
 		set_telem_proto = document.getElementById("proto").value;
-	}).catch(error => {
-		conn_status = 0
-		error.message;
+		change_ap_ip_visibility();
+		change_msp_ltm_visibility();
+		check_for_issues();
+		return true;
+	} catch (error) {
+		console.error("Failed to load or display settings:", error);
 		show_toast(error.message);
-		return -1;
-	});
-	change_ap_ip_visibility();
-	change_msp_ltm_visibility();
-	return 0;
+		return false;
+	}
 }
 
 function add_new_udp_client() {
@@ -396,7 +511,6 @@ function add_new_udp_client() {
 		};
 		send_json("api/settings/clients/udp", JSON.stringify(myjson)).then(send_response => {
 			console.log(send_response);
-			conn_status = 1
 			show_toast(send_response["msg"])
 		}).catch(error => {
 			show_toast(error.message);
@@ -419,7 +533,6 @@ async function clear_udp_clients() {
 			body: null
 		});
 		if (!response.ok) {
-			conn_status = 0
 			const message = `An error has occured: ${response.status}`;
 			throw new Error(message);
 		}
@@ -455,15 +568,34 @@ function check_validity() {
 		show_toast("Error: 8<(password length)<64");
 		valid = false;
 	}
+	let espnow_secret = document.getElementById("espnow_secret")
+	if (!espnow_secret.checkValidity()) {
+		show_toast("Error: ESP-NOW link secret must be 43 Base64URL characters");
+		valid = false;
+	}
 	return valid;
 }
 
+/**
+ * Update the frontend information boxes based on current serial and MAVLink state.
+ */
 function check_for_issues() {
 	let issue_div = document.getElementById("issue_div");
 	if (set_telem_proto === "4" && serial_dec_mav_msgs === 0 && recv_ser_bytes !== 0) {
 		issue_div.style.display = "block";
 	} else {
 		issue_div.style.display = "none";
+	}
+
+	let uart_pins_info_div = document.getElementById("uart_pins_info_div");
+	let gpio_tx = document.getElementById("gpio_tx");
+	let gpio_rx = document.getElementById("gpio_rx");
+	let uart_pins_not_configured = static_data_ready && serial_via_JTAG === 0 &&
+		gpio_tx.value !== "" && gpio_rx.value !== "" && gpio_tx.value === gpio_rx.value;
+	if (uart_pins_not_configured) {
+		uart_pins_info_div.style.display = "block";
+	} else {
+		uart_pins_info_div.style.display = "none";
 	}
 }
 
@@ -473,7 +605,6 @@ function save_settings() {
 		let json_data = toJSONString(form)
 		send_json("api/settings", json_data).then(send_response => {
 			console.log(send_response);
-			conn_status = 1
 			show_toast(send_response["msg"])
 			get_settings()  // update UI with new settings
 		}).catch(error => {

@@ -25,6 +25,7 @@
 #include <lwip/sockets.h>
 
 #define TAG "DB_PARAM"
+#define DB_PARAM_PRINT_LINE_BUFFER_SIZE 128U
 
 /**
  * Steps to add new parameters.
@@ -52,7 +53,7 @@ uint8_t DB_RADIO_MODE_DESIGNATED = DB_BUILD_DEFAULT_RADIO_MODE; // initially ass
 
 /* ---------- String based parameters - not available via MAVLink ---------- */
 
-db_parameter_t db_param_ssid, db_param_pass, db_param_wifi_ap_ip, db_param_wifi_sta_ip, db_param_wifi_sta_gw,
+db_parameter_t db_param_ssid, db_param_pass, db_param_espnow_link_secret, db_param_wifi_ap_ip, db_param_wifi_sta_ip, db_param_wifi_sta_gw,
     db_param_wifi_sta_netmask, db_param_udp_client_ip, db_param_wifi_hostname = {0};
 
 /* ---------- From here with increasing param_index all parameters that are also available via MAVLink ---------- */
@@ -322,7 +323,7 @@ db_parameter_t db_param_serial_pack_size = {
                         .value = 576,
                         .default_value = 576,
                         .min = 16,
-                        .max = 1023,
+                        .max = DB_SERIAL_PACK_SIZE_MAX,
                 }
         }
 };
@@ -436,6 +437,27 @@ db_parameter_t db_param_rssi_dbm = {
 };
 
 /**
+ * Enables delivery of authenticated MAVLink traffic from other ESP-NOW AIR units to the local flight controller.
+ */
+db_parameter_t db_param_espnow_air2air = {
+        .db_name = "espnow_air2air",
+        .type = UINT8,
+        .mav_t = {
+                .param_name = "ESPNOW_AIR2AIR",
+                .param_index = 17,
+                .param_type = MAV_PARAM_TYPE_UINT8,
+        },
+        .value = {
+                .db_param_u8 = {
+                        .value = false,
+                        .default_value = false,
+                        .min = false,
+                        .max = true,
+                }
+        }
+};
+
+/**
  * Array containing all references to the DB parameters assigned with db_param_init_parameters()
  */
 db_parameter_t *db_params[DB_PARAM_TOTAL_NUM] = {NULL};
@@ -486,7 +508,9 @@ db_parameter_t db_param_init_str_param(char *db_name, char *mav_param_name, cons
         strncpy((char *) db_str_param.value.db_param_str.value, (char *) db_str_param.value.db_param_str.default_value, max_val_len);
         // Ensure null termination, especially if default_value is >= max_val_len. For password this might not be necessary
         db_str_param.value.db_param_str.value[max_val_len - 1] = '\0';
-        ESP_LOGD(TAG, "Initialized value for %s with default '%s'", db_name, (char*)db_str_param.value.db_param_str.value);
+        ESP_LOGD(TAG, "Initialized value for %s%s", db_name,
+                 strcmp(db_name, "wifi_pass") == 0 || strcmp(db_name, "espnow_secret") == 0 ? " [redacted]" :
+                 (char*)db_str_param.value.db_param_str.value);
     }
     return db_str_param;
 }
@@ -501,6 +525,8 @@ void db_param_init_parameters() {
     db_param_ssid = db_param_init_str_param("ssid", "SYS_SSID", "DroneBridge for ESP32", 1, MAX_SSID_LEN);
     // Password for Wi-Fi connections & ESP-NOW encryption.
     db_param_pass = db_param_init_str_param("wifi_pass", "SYS_PASS", "dronebridge", 7, 64);
+    // Optional generated ESP-NOW secret. An empty value keeps legacy ESP-NOW pairs on wifi_pass.
+    db_param_espnow_link_secret = db_param_init_str_param("espnow_secret", "SYS_ESPNOWPASS", "", 0, 44);
     // IPv4 of the Wi-Fi access point when in Wi-Fi AP mode
     db_param_wifi_ap_ip = db_param_init_str_param("ap_ip", "WIFI_AP_IP", "192.168.2.1", 8, IP4ADDR_STRLEN_MAX);
     // User can specify static IP when in Wi-Fi client mode. If this is empty use auto IP.
@@ -517,6 +543,7 @@ void db_param_init_parameters() {
     db_parameter_t *db_params_l[] = {
             &db_param_ssid,
             &db_param_pass,
+            &db_param_espnow_link_secret,
             &db_param_wifi_ap_ip,
             &db_param_wifi_sta_ip,
             &db_param_wifi_sta_gw,
@@ -539,7 +566,8 @@ void db_param_init_parameters() {
             &db_param_ltm_per_packet,
             &db_param_dis_radio_armed,
             &db_param_udp_client_port,
-            &db_param_rssi_dbm
+            &db_param_rssi_dbm,
+            &db_param_espnow_air2air
     };
     memcpy(db_params, db_params_l, sizeof(db_params_l));
 }
@@ -581,40 +609,99 @@ void db_param_reset_all() {
 }
 
 /**
- * Helper function to convert all parameters with their values to a string buffer for logging etc.
- * @param str_buffer Buffer to write the parameter string - must be long enough ~512 bytes
+ * Formats one parameter value into a bounded, redacted diagnostic line.
+ *
+ * @param parameter Parameter to format.
+ * @param line_buffer Destination buffer for one complete line.
+ * @param line_buffer_size Capacity of line_buffer in bytes.
+ * @param line_length Receives the line length excluding the terminator.
+ * @return true when the complete line fit in line_buffer, otherwise false.
  */
-int db_param_print_values_to_buffer(uint8_t *str_buffer) {
-    int str_len = 1; // overall length of the string in the str_buffer
-    str_buffer[0] = '\n';
-    str_buffer[1] = '\0';
-    for (int i = 0; i < sizeof(db_params) / sizeof(db_params[0]); i++) {
-        uint8_t param_str_buf[128]; // buffer for the string of a single value
-        switch (db_params[i]->type) {
-            case STRING:
-                str_len += sprintf((char *) param_str_buf, "\t%s: %s\n", (char *) db_params[i]->db_name,
-                                   (char *) db_params[i]->value.db_param_str.value);
-                break;
-            case UINT8:
-                str_len += sprintf((char *) param_str_buf, "\t%s: %i\n", (char *) db_params[i]->db_name,
-                                   db_params[i]->value.db_param_u8.value);
-                break;
-            case UINT16:
-                str_len += sprintf((char *) param_str_buf, "\t%s: %i\n", (char *) db_params[i]->db_name,
-                                   db_params[i]->value.db_param_u16.value);
-                break;
-            case INT32:
-                str_len += sprintf((char *) param_str_buf, "\t%s: %li\n", (char *) db_params[i]->db_name,
-                                   db_params[i]->value.db_param_i32.value);
-                break;
-            default:
-                ESP_LOGE(TAG, "db_param_print_values_to_buffer() -> db_parameter.type unknown!");
-                break;
-        }
-        strcat((char *) str_buffer,
-               (char *) param_str_buf); // add the string of the individual printed param to the big buffer
+static bool db_param_format_value_line(const db_parameter_t *parameter, uint8_t *line_buffer,
+                                       const size_t line_buffer_size, size_t *line_length) {
+    if (parameter == NULL || line_buffer == NULL || line_length == NULL || line_buffer_size == 0U) {
+        return false;
     }
-    return str_len;
+
+    int written = -1;
+    switch (parameter->type) {
+        case STRING:
+            if (strcmp((char *) parameter->db_name, (char *) db_param_pass.db_name) == 0 ||
+                strcmp((char *) parameter->db_name, (char *) db_param_espnow_link_secret.db_name) == 0) {
+                written = snprintf((char *) line_buffer, line_buffer_size, "\t%s: [redacted]\n",
+                                   (char *) parameter->db_name);
+            } else {
+                written = snprintf((char *) line_buffer, line_buffer_size, "\t%s: %s\n", (char *) parameter->db_name,
+                                   (char *) parameter->value.db_param_str.value);
+            }
+            break;
+        case UINT8:
+            written = snprintf((char *) line_buffer, line_buffer_size, "\t%s: %i\n", (char *) parameter->db_name,
+                               parameter->value.db_param_u8.value);
+            break;
+        case UINT16:
+            written = snprintf((char *) line_buffer, line_buffer_size, "\t%s: %i\n", (char *) parameter->db_name,
+                               parameter->value.db_param_u16.value);
+            break;
+        case INT32:
+            written = snprintf((char *) line_buffer, line_buffer_size, "\t%s: %li\n", (char *) parameter->db_name,
+                               parameter->value.db_param_i32.value);
+            break;
+        default:
+            ESP_LOGE(TAG, "db_param_format_value_line() -> db_parameter.type unknown!");
+            return false;
+    }
+
+    if (written < 0 || (size_t) written >= line_buffer_size) {
+        ESP_LOGE(TAG, "Parameter log line does not fit for %s", (char *) parameter->db_name);
+        return false;
+    }
+    *line_length = (size_t) written;
+    return true;
+}
+
+/**
+ * Streams all parameter values as independently bounded, redacted diagnostic lines.
+ *
+ * @param output_callback Callback that consumes every formatted parameter line.
+ * @param context Caller-owned context passed to output_callback.
+ * @return true when every parameter was emitted, otherwise false.
+ */
+bool db_param_stream_values(const db_param_output_callback_t output_callback, void *context) {
+    if (output_callback == NULL) {
+        return false;
+    }
+
+    uint8_t line_buffer[DB_PARAM_PRINT_LINE_BUFFER_SIZE] = {0};
+    for (int i = 0; i < sizeof(db_params) / sizeof(db_params[0]); i++) {
+        size_t line_length = 0U;
+        if (!db_param_format_value_line(db_params[i], line_buffer, sizeof(line_buffer), &line_length) ||
+            !output_callback(line_buffer, line_length, context)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/**
+ * Writes all parameter values to the ESP log without exposing sensitive values.
+ */
+static bool db_param_log_value_line(const uint8_t *line, const size_t line_length, void *context) {
+    (void) context;
+    if (line == NULL || line_length == 0U) {
+        return false;
+    }
+    ESP_LOGI(TAG, "%.*s", (int) (line_length - 1U), (const char *) line);
+    return true;
+}
+
+/**
+ * Logs all parameter values using bounded per-parameter formatting.
+ */
+void db_param_log_values() {
+    if (!db_param_stream_values(db_param_log_value_line, NULL)) {
+        ESP_LOGE(TAG, "Unable to print all parameter values");
+    }
 }
 
 /**
@@ -643,12 +730,21 @@ void db_read_str_nvs(nvs_handle_t my_handle, db_parameter_t *db_param) {
                 ESP_LOGE(TAG, "Error (%s) reading string %s from NVS! Using default.", esp_err_to_name(err), (char *) db_param->db_name);
                 db_param_set_to_default(db_param);
             } else {
-                ESP_LOGD(TAG, "Read %s from NVS: '%s'", (char *) db_param->db_name, (char *)db_param->value.db_param_str.value);
+                if (strcmp((char *) db_param->db_name, (char *) db_param_pass.db_name) == 0 ||
+                    strcmp((char *) db_param->db_name, (char *) db_param_espnow_link_secret.db_name) == 0) {
+                    ESP_LOGD(TAG, "Read %s from NVS: [redacted]", (char *) db_param->db_name);
+                } else {
+                    ESP_LOGD(TAG, "Read %s from NVS: '%s'", (char *) db_param->db_name,
+                             (char *) db_param->value.db_param_str.value);
+                }
             }
         }
     } else if (err == ESP_ERR_NVS_NOT_FOUND) {
-        // *** THIS IS THE CRITICAL PART ***
-        ESP_LOGI(TAG, "Parameter %s not found in NVS, using default.", (char *) db_param->db_name);
+        if (strcmp((char *) db_param->db_name, (char *) db_param_espnow_link_secret.db_name) == 0) {
+            ESP_LOGD(TAG, "Optional ESP-NOW link secret not found in NVS, using legacy fallback.");
+        } else {
+            ESP_LOGI(TAG, "Parameter %s not found in NVS, using default.", (char *) db_param->db_name);
+        }
         db_param_set_to_default(db_param); // Apply the default value
     } else {
         ESP_LOGE(TAG, "Error (%s) checking NVS for %s! Using default.", esp_err_to_name(err), (char *) db_param->db_name);
@@ -677,9 +773,19 @@ void db_param_read_all_params_nvs(const nvs_handle_t *nvs_handle) {
                 }
                 break;
             case UINT8:
-                ESP_ERROR_CHECK_WITHOUT_ABORT(
-                        nvs_get_u8(*nvs_handle, (char *) db_params[i]->db_name,
-                                   &db_params[i]->value.db_param_u8.value));
+                {
+                const esp_err_t read_result = nvs_get_u8(*nvs_handle, (char *) db_params[i]->db_name,
+                                                         &db_params[i]->value.db_param_u8.value);
+                if (read_result == ESP_ERR_NVS_NOT_FOUND) {
+                    ESP_LOGI(TAG, "Parameter %s not found in NVS, using default.", db_params[i]->db_name);
+                    break;
+                }
+                if (read_result != ESP_OK) {
+                    ESP_LOGW(TAG, "Unable to read parameter %s from NVS: %s. Using default.",
+                             db_params[i]->db_name, esp_err_to_name(read_result));
+                    db_params[i]->value.db_param_u8.value = db_params[i]->value.db_param_u8.default_value;
+                    break;
+                }
                 if (!db_param_is_valid_u8(db_params[i]->value.db_param_u8.value, db_params[i])) {
                     // read parameter is not valid - overwrite NVS value with default value
                     db_params[i]->value.db_param_u8.value = db_params[i]->value.db_param_u8.default_value;
@@ -687,10 +793,21 @@ void db_param_read_all_params_nvs(const nvs_handle_t *nvs_handle) {
                              db_params[i]->db_name, db_params[i]->value.db_param_u8.default_value);
                 }
                 break;
+                }
             case UINT16:
-                ESP_ERROR_CHECK_WITHOUT_ABORT(
-                        nvs_get_u16(*nvs_handle, (char *) db_params[i]->db_name,
-                                    &db_params[i]->value.db_param_u16.value));
+                {
+                const esp_err_t read_result = nvs_get_u16(*nvs_handle, (char *) db_params[i]->db_name,
+                                                          &db_params[i]->value.db_param_u16.value);
+                if (read_result == ESP_ERR_NVS_NOT_FOUND) {
+                    ESP_LOGI(TAG, "Parameter %s not found in NVS, using default.", db_params[i]->db_name);
+                    break;
+                }
+                if (read_result != ESP_OK) {
+                    ESP_LOGW(TAG, "Unable to read parameter %s from NVS: %s. Using default.",
+                             db_params[i]->db_name, esp_err_to_name(read_result));
+                    db_params[i]->value.db_param_u16.value = db_params[i]->value.db_param_u16.default_value;
+                    break;
+                }
                 if (!db_param_is_valid_u16(db_params[i]->value.db_param_u16.value, db_params[i])) {
                     // read parameter is not valid - overwrite NVS value with default value
                     db_params[i]->value.db_param_u16.value = db_params[i]->value.db_param_u16.default_value;
@@ -698,10 +815,21 @@ void db_param_read_all_params_nvs(const nvs_handle_t *nvs_handle) {
                              db_params[i]->db_name, db_params[i]->value.db_param_u16.default_value);
                 }
                 break;
+                }
             case INT32:
-                ESP_ERROR_CHECK_WITHOUT_ABORT(
-                        nvs_get_i32(*nvs_handle, (char *) db_params[i]->db_name,
-                                    &db_params[i]->value.db_param_i32.value));
+                {
+                const esp_err_t read_result = nvs_get_i32(*nvs_handle, (char *) db_params[i]->db_name,
+                                                          &db_params[i]->value.db_param_i32.value);
+                if (read_result == ESP_ERR_NVS_NOT_FOUND) {
+                    ESP_LOGI(TAG, "Parameter %s not found in NVS, using default.", db_params[i]->db_name);
+                    break;
+                }
+                if (read_result != ESP_OK) {
+                    ESP_LOGW(TAG, "Unable to read parameter %s from NVS: %s. Using default.",
+                             db_params[i]->db_name, esp_err_to_name(read_result));
+                    db_params[i]->value.db_param_i32.value = db_params[i]->value.db_param_i32.default_value;
+                    break;
+                }
                 if (!db_param_is_valid_i32(db_params[i]->value.db_param_i32.value, db_params[i])) {
                     // read parameter is not valid - overwrite NVS value with default value
                     db_params[i]->value.db_param_i32.value = db_params[i]->value.db_param_i32.default_value;
@@ -709,6 +837,7 @@ void db_param_read_all_params_nvs(const nvs_handle_t *nvs_handle) {
                              db_params[i]->db_name, db_params[i]->value.db_param_i32.default_value);
                 }
                 break;
+                }
             default:
                 ESP_LOGE(TAG, "db_param_read_all_params_to_nvs() -> db_parameter.type unknown!");
                 break;
@@ -853,11 +982,15 @@ bool is_valid_ip4(const char *ipaddress) {
  */
 bool db_param_is_valid_str(char *new_string_value, db_parameter_t *target_param) {
     // ToDo: Add IPv4 check for strings via custom validation function in db_parameter_t
-    if (new_string_value != NULL &&
-        strlen(new_string_value) <= target_param->value.db_param_str.max_len &&
-        strlen(new_string_value) >= target_param->value.db_param_str.min_len) {
-        return true;
-    } else { return false; }
+    if (new_string_value != NULL) {
+        const size_t string_len = strlen(new_string_value);
+        if (target_param->value.db_param_str.max_len > 0 &&
+            string_len < target_param->value.db_param_str.max_len &&
+            string_len >= target_param->value.db_param_str.min_len) {
+            return true;
+        }
+    }
+    return false;
 };
 
 /**
@@ -904,7 +1037,9 @@ bool db_param_is_valid_i32(const int32_t new_i32_value, db_parameter_t *target_p
  */
 bool db_param_is_valid_assign_str(char *new_string_value, db_parameter_t *target_param) {
     if (db_param_is_valid_str(new_string_value, target_param)) {
-        strncpy((char *) target_param->value.db_param_str.value, new_string_value, DB_PARAM_VALUE_MAXLEN);
+        strlcpy((char *) target_param->value.db_param_str.value,
+                new_string_value,
+                target_param->value.db_param_str.max_len);
         return true;
     } else {
         // new value is not valid - do not assign

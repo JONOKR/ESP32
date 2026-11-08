@@ -25,6 +25,10 @@
 <div class="container">
     <form id="settings_form">
         <div>
+            <div class="info note" id="uart_pins_info_div" style="display: none;">
+                <h4>Attention:</h4>
+                UART TX and RX pins are not configured. Set the correct GPIO pins for UART TX and RX before DroneBridge can forward data.
+            </div>
             <div class="info issue" id="issue_div">
                 There might be an issue with your baud rate configuration.<br>Match the UART baud rates on the flight controller and the ESP32.<br>The ESP32 is receiving serial bytes but fails to decode the MAVLink messages.
             </div>
@@ -78,22 +82,36 @@
                         normal Wi-Fi Mode!
                     </div>
                     <div class="info note" id="ble_disclaimer_div"><h4>Attention:</h4>
-                        <b>BETA: Bluetooth LE (BLE) is currently in beta testing.</b><br>
-                        The application (e.g. GCS software, Betaflight Configurator) must explicitly support DroneBridge BLE connections.<br>
-                        At the moment only the recent Betaflight Configurator (BFC) supports BLE connections but does so very poorly.<br><br>
-                        Use the <a href="https://dronebridge.gitbook.io/docs/dronebridge-for-esp32/configuration#bluetooth-le">DroneBridge BLE Bridge</a> to connect QGC, MissionPlanner or BFC to your ESP32 running DroneBridge BLE.<br>
+                        The application (e.g. GCS software, Betaflight Configurator) must explicitly support BLE connections.<br>
+                        Use the <a href="https://dronebridge.gitbook.io/docs/dronebridge-for-esp32/configuration#bluetooth-le">DroneBridge BLE Bridge</a> to connect any GCS like QGC, MissionPlanner or BFC to your ESP32 running DroneBridge BLE.<br>
                         Your Wi-Fi Access Point Mode configuration will be used to host an AP in parallel so you can still access this configuration page.
                     </div>
                 </div>
             </div>
             <div class="row">
                 <div class="six columns" id="wifi_ssid_div">
-                    <label for="ssid">SSID</label>
+                    <label for="ssid">Wi-Fi SSID</label>
                     <input type="text" name="ssid" value="" id="ssid" maxlength="31">
                 </div>
                 <div class="six columns" id="pass_div">
-                    <label for="wifi_pass">Password</label>
+                    <label for="wifi_pass">Wi-Fi Password</label>
                     <input type="text" name="wifi_pass" value="" id="wifi_pass" minlength="8" maxlength="63" required>
+                </div>
+            </div>
+            <div class="row" id="espnow_secret_div">
+                <div class="twelve columns">
+                    <label for="espnow_secret">ESP-NOW link secret</label>
+                    <input type="text" name="espnow_secret" value="" id="espnow_secret" minlength="43" maxlength="43" pattern="[A-Za-z0-9_-]{43}">
+                    <button class="button-primary" type="button" id="espnow_rotate_secret_button" onclick="rotate_espnow_secret()">Rotate</button>
+                    <div class="info note">Binding creates the ESP-NOW link secret automatically. Rotating it disconnects all currently bound AIR units; they need to be re-bound.<br>Leave it empty only to use the legacy Wi-Fi password for ESP-NOW.<br>AIR and GND must have matching secrets.</div>
+                </div>
+            </div>
+            <div class="row" id="espnow_air2air_div">
+                <div class="twelve columns">
+                    <div class="checkbox-wrapper-14">
+                        <input id="espnow_air2air" name="espnow_air2air" type="checkbox" class="switch">
+                        <label class="tooltip" for="espnow_air2air"><span class="tooltiptext">For ESP-NOW AIR units using MAVLink only. When enabled, all authenticated MAVLink frames sent by other AIR units in the same ESP-NOW group are forwarded to this unit's flight controller. Enable this only when the flight controllers intentionally share a MAVLink bus and use unique system IDs.</span>Forward MAVLink from other AIR units</label>
+                    </div>
                 </div>
             </div>
             <div class="row">
@@ -259,6 +277,7 @@
                         <option value="128">128</option>
                         <option value="160">160</option>
                         <option value="192">192</option>
+                        <option value="215">215</option>
                         <option value="224">224</option>
                         <option value="256">256</option>
                         <option value="288">288</option>
@@ -316,11 +335,8 @@
     <div style="margin-bottom: 2rem" class="row">&copy; Wolfgang Christl 2018 - Apache 2.0 License</div>
 </div>
 <script>
-    // get settings once upon page load
-    while (get_system_info() < 0) {
-    }
-    while (get_settings() < 0) {
-    }
+    // Get system information and settings once upon page load.
+    refresh_static_data()
     // get stats every half a second
     setInterval(get_stats, 500)
     setInterval(update_conn_status, 500)

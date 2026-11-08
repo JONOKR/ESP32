@@ -39,11 +39,21 @@
 
 #define TAG "DB_ESPNOW"
 
-const uint8_t BROADCAST_MAC[ESP_NOW_ETH_ALEN] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+static const uint8_t BROADCAST_MAC[ESP_NOW_ETH_ALEN] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 static QueueHandle_t db_espnow_send_recv_callback_queue;    // Queue that contains ESP-NOW callback results
 QueueHandle_t db_espnow_send_queue;    // Queue that contains data to be sent via ESP-NOW (filled by control task)
 QueueHandle_t db_uart_write_queue;    // Queue that contains data to be written to UART (filled by ESP-NOW task)
-db_esp_now_clients_list_t *db_esp_now_clients_list; // Local list of known ESP-NOW peers with the last RSSI value and noise floor and sequence number
+static db_esp_now_clients_list_t *db_esp_now_clients_list;
+
+/**
+ * Read-only view of the ESP-NOW peer list - see db_esp_now.h for why this
+ * exists instead of an `extern`.
+ *
+ * @return pointer to the peer list, or NULL before ESP-NOW is initialised
+ */
+const db_esp_now_clients_list_t *db_espnow_peer_list(void) {
+    return db_esp_now_clients_list;
+} // Local list of known ESP-NOW peers with the last RSSI value and noise floor and sequence number
 
 // packet that is filled with payload and sent. Updates the sequ. number with every send.
 static db_esp_now_packet_t db_esp_now_packet_global = {
@@ -52,7 +62,29 @@ static db_esp_now_packet_t db_esp_now_packet_global = {
 };   // make static so it gets instanced only once
 
 mbedtls_gcm_context aes;
-uint8_t const db_esp_now_packet_header_len = sizeof(db_esp_now_packet_header_t);
+static uint8_t const db_esp_now_packet_header_len = sizeof(db_esp_now_packet_header_t);
+
+/**
+ * Returns whether the local radio role is configured to accept a packet origin.
+ *
+ * AIR-to-AIR delivery is deliberately limited to MAVLink mode so MSP/LTM and
+ * transparent serial links retain their existing peer isolation.
+ *
+ * @param origin Authenticated origin value from an ESP-NOW packet header.
+ * @return true when packets from the origin may be processed locally.
+ */
+static bool db_espnow_origin_is_allowed(const uint8_t origin) {
+    if (DB_PARAM_RADIO_MODE == DB_WIFI_MODE_ESPNOW_GND) {
+        return origin == DB_ESPNOW_ORIGIN_AIR;
+    }
+    if (DB_PARAM_RADIO_MODE == DB_WIFI_MODE_ESPNOW_AIR) {
+        return origin == DB_ESPNOW_ORIGIN_GND ||
+               (origin == DB_ESPNOW_ORIGIN_AIR &&
+                DB_PARAM_SERIAL_PROTO == DB_SERIAL_PROTOCOL_MAVLINK &&
+                DB_PARAM_ESPNOW_AIR2AIR);
+    }
+    return false;
+}
 
 /**
  * Generates a AES key from a password using pkcs5 - pbkdf2 and mbedTLS
@@ -292,59 +324,86 @@ int16_t update_peer_list(db_esp_now_clients_list_t *esp_now_clients, uint8_t bro
  * @param data_len  Length of received data
  * @param src_addr Source MAC address of the data
  * @param rssi RSSI in dBm of this packet
+ * @param noise_floor Noise floor in dBm measured while receiving this packet
  */
-void db_espnow_process_rcv_data(uint8_t *data, uint16_t data_len, uint8_t *src_addr, int8_t rssi) {
+void db_espnow_process_rcv_data(uint8_t *data, uint16_t data_len, uint8_t *src_addr, int8_t rssi, int8_t noise_floor) {
+    const uint16_t minimum_packet_length = db_esp_now_packet_header_len + DB_ESPNOW_AES_TAG_LEN + 1U;
+    if (data == NULL || src_addr == NULL || data_len < minimum_packet_length) {
+        ESP_LOGW(TAG, "Ignoring malformed ESP-NOW packet of length %u", data_len);
+        return;
+    }
     db_esp_now_packet_t *db_esp_now_packet = (db_esp_now_packet_t *) data;
-    uint8_t len_payload = data_len - DB_ESPNOW_AES_TAG_LEN - db_esp_now_packet_header_len;
+    const uint16_t protected_data_length = data_len - DB_ESPNOW_AES_TAG_LEN - db_esp_now_packet_header_len;
+    if (protected_data_length > DB_ESPNOW_PAYLOAD_MAXSIZE + 1U) {
+        ESP_LOGW(TAG, "Ignoring oversized ESP-NOW protected payload of length %u", protected_data_length);
+        return;
+    }
+    const uint8_t len_payload = (uint8_t) protected_data_length;
     uint8_t db_decrypted_data[len_payload];
 
     /* Decrypt and authenticate packet - only then process its contents */
     if (db_decrypt_payload(db_esp_now_packet, db_decrypted_data, len_payload) == 0) {
+        const uint8_t origin = db_esp_now_packet->db_esp_now_packet_header.origin;
+        if (!db_espnow_origin_is_allowed(origin)) {
+            ESP_LOGW(TAG, "Ignoring authenticated ESP-NOW packet with disallowed origin %u", origin);
+            return;
+        }
+        if (db_decrypted_data[0] != len_payload - 1U) {
+            ESP_LOGW(TAG, "Ignoring ESP-NOW packet with inconsistent decrypted payload length");
+            return;
+        }
+
         /* Check if we know that peer already */
-        int16_t peer_index = update_peer_list(db_esp_now_clients_list, src_addr);
-        if (peer_index != -1) {
-            if (DB_PARAM_RADIO_MODE == DB_WIFI_MODE_ESPNOW_GND) {
-                // update the list with the rssi only if we are GND
+        if (DB_PARAM_RADIO_MODE == DB_WIFI_MODE_ESPNOW_GND && origin == DB_ESPNOW_ORIGIN_AIR) {
+            db_esp_now_clients_list->gnd_noise_floor = noise_floor;
+            int16_t peer_index = update_peer_list(db_esp_now_clients_list, src_addr);
+            if (peer_index != -1) {
+                // Update the list with RSSI and packet loss only on the GND side.
                 db_esp_now_clients_list->db_esp_now_bpeer_info[peer_index].gnd_rssi = rssi;
-            } else {
-                // AIR unit keeps track of RSSI using db_esp_signal_quality variable
-                // no need to do here anything
-                // TODO: Clean up RSSI variables - a bit confusing that AIR and GND use different structures
-            }
             // check packet sequence number
-            if (db_esp_now_clients_list->db_esp_now_bpeer_info[peer_index].last_seq_num < db_esp_now_packet->db_esp_now_packet_header.seq_num) {
+                if (db_esp_now_clients_list->db_esp_now_bpeer_info[peer_index].last_seq_num < db_esp_now_packet->db_esp_now_packet_header.seq_num) {
                 // Count the lost packets per peer since the last received packet
-                db_esp_now_clients_list->db_esp_now_bpeer_info[peer_index].gnd_rx_lost_packets +=
+                    db_esp_now_clients_list->db_esp_now_bpeer_info[peer_index].gnd_rx_lost_packets +=
                         (db_esp_now_packet->db_esp_now_packet_header.seq_num -
                         db_esp_now_clients_list->db_esp_now_bpeer_info[peer_index].last_seq_num - 1);
-            } else {
-                ESP_LOGW(TAG, "Sequence number lower than expected. Sender did reset or packet may be part of a replay attack.");
+                } else {
+                    ESP_LOGW(TAG, "Sequence number lower than expected. Sender did reset or packet may be part of a replay attack.");
                 // accept packet anyway for now to make for a more robust link
-                db_esp_now_clients_list->db_esp_now_bpeer_info[peer_index].gnd_rx_lost_packets = 0;
-            }
+                    db_esp_now_clients_list->db_esp_now_bpeer_info[peer_index].gnd_rx_lost_packets = 0;
+                }
 
-            db_esp_now_clients_list->db_esp_now_bpeer_info[peer_index].last_seq_num = db_esp_now_packet->db_esp_now_packet_header.seq_num;
-        } else {
-            /* Do nothing since we only count packet loss and rssi on the GND side not on the air side
-             * and only if there is still a free spot in the list */
+                db_esp_now_clients_list->db_esp_now_bpeer_info[peer_index].last_seq_num = db_esp_now_packet->db_esp_now_packet_header.seq_num;
+            }
+        } else if (DB_PARAM_RADIO_MODE == DB_WIFI_MODE_ESPNOW_AIR && origin == DB_ESPNOW_ORIGIN_GND) {
+            // AIR link quality must describe the GND link, never a neighbouring AIR peer.
+            db_esp_signal_quality.air_rssi = rssi;
+            db_esp_signal_quality.air_noise_floor = noise_floor;
         }
 
         /* Process packet depending on packet type */
         if (db_esp_now_packet->db_esp_now_packet_header.packet_type == DB_ESP_NOW_PACKET_TYPE_DATA) {
             // Pass data to UART queue
-            db_espnow_queue_event_t db_uart_evt;
+            db_espnow_uart_queue_event_t db_uart_evt = {0};
             db_uart_evt.data_len = db_decrypted_data[0];    // should be equal to len_payload-1 if everything worked out
             db_uart_evt.data = malloc(db_uart_evt.data_len);
             // For some reason it seems we cannot directly decrypt to db_espnow_uart_event_t -> Queues get set to NULL
             memcpy(db_uart_evt.data, &db_decrypted_data[1], db_uart_evt.data_len);
+            memcpy(db_uart_evt.source_mac, src_addr, ESP_NOW_ETH_ALEN);
+            db_uart_evt.seq_num = db_esp_now_packet->db_esp_now_packet_header.seq_num;
+            db_uart_evt.origin = origin;
             if (xQueueSend(db_uart_write_queue, &db_uart_evt, ESPNOW_MAXDELAY) != pdTRUE) {
                 ESP_LOGW(TAG, "Send to db_uart_write_queue failed");
                 free(db_uart_evt.data);
             } else {
                 // all good
             }
-        } else if (db_esp_now_packet->db_esp_now_packet_header.packet_type == DB_ESP_NOW_PACKET_TYPE_INTERNAL_TELEMETRY) {
+        } else if (db_esp_now_packet->db_esp_now_packet_header.packet_type == DB_ESP_NOW_PACKET_TYPE_INTERNAL_TELEMETRY &&
+                   DB_PARAM_RADIO_MODE == DB_WIFI_MODE_ESPNOW_AIR && origin == DB_ESPNOW_ORIGIN_GND) {
             /* This is only called on the AIR side since GND sends telemetry to AIR only */
+            if (db_decrypted_data[0] != sizeof(db_esp_now_clients_list_t)) {
+                ESP_LOGW(TAG, "Ignoring ESP-NOW internal telemetry with unexpected payload length");
+                return;
+            }
             db_esp_now_clients_list_t *clients = (db_esp_now_clients_list_t*) &db_decrypted_data[1];
             ESP_LOGD(TAG, "Received internal telemetry frame containing %i entries", clients->size);
             for (int i = 0; i < clients->size; i++) {
@@ -418,11 +477,16 @@ static void db_espnow_send_callback(const uint8_t *mac_addr, esp_now_send_status
 static void db_espnow_receive_callback(const esp_now_recv_info_t *recv_info, const uint8_t *data, int len) {
     db_espnow_event_t evt;
     db_espnow_event_recv_cb_t *recv_cb = &evt.info.recv_cb;
+    const uint16_t minimum_packet_length = db_esp_now_packet_header_len + DB_ESPNOW_AES_TAG_LEN + 1U;
+
+    if (recv_info == NULL || data == NULL || len < minimum_packet_length) {
+        ESP_LOGE(TAG, "Receive callback arg error");
+        return;
+    }
     uint8_t *src_addr = recv_info->src_addr;
     uint8_t *des_addr = recv_info->des_addr;
-
-    if (src_addr == NULL || data == NULL || len <= 0) {
-        ESP_LOGE(TAG, "Receive callback arg error");
+    if (src_addr == NULL || des_addr == NULL) {
+        ESP_LOGE(TAG, "Receive callback address error");
         return;
     }
 
@@ -431,26 +495,10 @@ static void db_espnow_receive_callback(const esp_now_recv_info_t *recv_info, con
         return;
     }
 
-    if (data[0] == DB_ESPNOW_ORIGIN_GND && DB_PARAM_RADIO_MODE == DB_WIFI_MODE_ESPNOW_GND) {
-        // Ignoring packet - Came from another GND station
+    // The header is authenticated later. This early rejection only avoids allocating and queueing known-disallowed traffic.
+    if (!db_espnow_origin_is_allowed(data[0])) {
+        ESP_LOGD(TAG, "Receive ESP-NOW data with disallowed origin. Ignoring");
         return;
-    } else {
-        // we are GND and packet is for us from AIR
-#if defined(CONFIG_IDF_TARGET_ESP32) || defined(CONFIG_IDF_TARGET_ESP32S3) || defined(CONFIG_IDF_TARGET_ESP32C3) || defined(CONFIG_IDF_TARGET_ESP32C2) || defined(CONFIG_IDF_TARGET_ESP32S2) || defined(CONFIG_IDF_TARGET_ESP32C6)
-        db_esp_now_clients_list->gnd_noise_floor = (int8_t ) recv_info->rx_ctrl->noise_floor;
-        // rest RSSI will be processed in process_espnow_data()
-#endif
-    }
-
-    if (data[0] == DB_ESPNOW_ORIGIN_AIR && DB_PARAM_RADIO_MODE == DB_WIFI_MODE_ESPNOW_AIR) {
-        // Ignoring packet - Came from another AIR station
-        return;
-    } else {
-        // we are AIR a packet is for us from GND - we only expect one GND station to be talking to us
-        db_esp_signal_quality.air_rssi = recv_info->rx_ctrl->rssi;
-#if defined(CONFIG_IDF_TARGET_ESP32) || defined(CONFIG_IDF_TARGET_ESP32S3) || defined(CONFIG_IDF_TARGET_ESP32C3) || defined(CONFIG_IDF_TARGET_ESP32C2) || defined(CONFIG_IDF_TARGET_ESP32S2) || defined(CONFIG_IDF_TARGET_ESP32C6)
-        db_esp_signal_quality.air_noise_floor = recv_info->rx_ctrl->noise_floor;
-#endif
     }
 
     evt.id = DB_ESPNOW_RECV_CB;
@@ -462,7 +510,13 @@ static void db_espnow_receive_callback(const esp_now_recv_info_t *recv_info, con
     }
     memcpy(recv_cb->data, data, len);
     recv_cb->data_len = len;
-    recv_cb->rssi = recv_info->rx_ctrl->rssi;
+    recv_cb->rssi = recv_info->rx_ctrl == NULL ? -127 : recv_info->rx_ctrl->rssi;
+    recv_cb->noise_floor = 0;
+#if defined(CONFIG_IDF_TARGET_ESP32) || defined(CONFIG_IDF_TARGET_ESP32S3) || defined(CONFIG_IDF_TARGET_ESP32C3) || defined(CONFIG_IDF_TARGET_ESP32C2) || defined(CONFIG_IDF_TARGET_ESP32S2) || defined(CONFIG_IDF_TARGET_ESP32C6)
+    if (recv_info->rx_ctrl != NULL) {
+        recv_cb->noise_floor = recv_info->rx_ctrl->noise_floor;
+    }
+#endif
     if (db_espnow_send_recv_callback_queue != NULL && xQueueSend(db_espnow_send_recv_callback_queue, &evt, ESPNOW_MAXDELAY) != pdTRUE) {
         ESP_LOGW(TAG, "Send to receive queue fail");
         free(recv_cb->data);
@@ -501,12 +555,8 @@ void db_espnow_broadcast_peers_list_destroy(db_esp_now_clients_list_t *esp_now_c
  */
 int init_gcm_encryption_module(uint8_t *aes_key) {
     mbedtls_gcm_init(&aes);
-    generate_pkcs5_key(DB_PARAM_PASS, aes_key, AES_256_KEY_BYTES);
-    ESP_LOGI(TAG, "Derived AES Key:");
-    for (int i = 0; i < AES_256_KEY_BYTES; ++i) {
-        printf("%02x", aes_key[i]);
-    }
-    printf("\n");
+    const char *espnow_secret = strlen(DB_PARAM_ESPNOW_LINK_SECRET) > 0 ? DB_PARAM_ESPNOW_LINK_SECRET : DB_PARAM_PASS;
+    generate_pkcs5_key(espnow_secret, aes_key, AES_256_KEY_BYTES);
     int ret = mbedtls_gcm_setkey(&aes, MBEDTLS_CIPHER_ID_AES, aes_key, DB_ESPNOW_AES_KEY_LEN);
     return ret;
 }
@@ -537,7 +587,7 @@ esp_err_t db_espnow_init() {
 
     /* Init Queues for communication with control task */
     db_espnow_send_queue = xQueueCreate(ESPNOW_QUEUE_SIZE, sizeof(db_espnow_queue_event_t));
-    db_uart_write_queue = xQueueCreate(ESPNOW_QUEUE_SIZE, sizeof(db_espnow_queue_event_t));
+    db_uart_write_queue = xQueueCreate(ESPNOW_QUEUE_SIZE, sizeof(db_espnow_uart_queue_event_t));
     if (db_espnow_send_queue == NULL) {
         ESP_LOGE(TAG, "Create db_espnow_send_queue mutex fail");
         return ESP_FAIL;
@@ -664,7 +714,8 @@ _Noreturn void process_espnow_data() {
                 }
                 case DB_ESPNOW_RECV_CB: {
                     db_espnow_event_recv_cb_t *recv_cb = &evt.info.recv_cb;
-                    db_espnow_process_rcv_data(recv_cb->data, recv_cb->data_len, recv_cb->mac_addr, recv_cb->rssi);
+                    db_espnow_process_rcv_data(recv_cb->data, recv_cb->data_len, recv_cb->mac_addr, recv_cb->rssi,
+                                                recv_cb->noise_floor);
                     free(recv_cb->data);
                     break;
                 }

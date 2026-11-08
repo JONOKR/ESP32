@@ -44,6 +44,7 @@
 #include "db_parameters.h"
 #include "mdns.h"
 #include "db_esp_now.h"
+#include "db_espnow_binding.h"
 #include "db_serial.h"
 #include "db_led_indicator.h"
 #include "globals.h"
@@ -87,7 +88,7 @@ static EventGroupHandle_t s_wifi_event_group;
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
 
-esp_netif_t *esp_default_netif;
+static esp_netif_t *esp_default_netif;
 
 static esp_err_t db_set_dns_server(esp_netif_t *netif, uint32_t addr, esp_netif_dns_type_t type) {
     if (addr && (addr != IPADDR_NONE)) {
@@ -438,9 +439,9 @@ int db_init_wifi_clientmode() {
      * happened. */
     bool enable_temp_ap_mode = false;
     if (bits & WIFI_CONNECTED_BIT) {
-        ESP_LOGI(TAG, "Connected to ap SSID:%s password:%s", DB_PARAM_WIFI_SSID, DB_PARAM_PASS);
+        ESP_LOGI(TAG, "Connected to ap SSID:%s", DB_PARAM_WIFI_SSID);
     } else if (bits & WIFI_FAIL_BIT) {
-        ESP_LOGW(TAG, "Failed to connect to SSID:%s, password:%s", DB_PARAM_WIFI_SSID, DB_PARAM_PASS);
+        ESP_LOGW(TAG, "Failed to connect to SSID:%s", DB_PARAM_WIFI_SSID);
         enable_temp_ap_mode = true;
     } else {
         ESP_LOGE(TAG, "UNEXPECTED WIFI EVENT");
@@ -461,7 +462,7 @@ int db_init_wifi_clientmode() {
  * LR mode makes it very inconvenient to change settings but gives the most range. No AP mode since AP will not be
  * visible.
  */
-void db_init_wifi_espnow() {
+void db_init_wifi_espnow_channel(uint8_t channel) {
     ESP_LOGI(TAG, "Setting up Wi-Fi for ESP-NOW");
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -471,7 +472,7 @@ void db_init_wifi_espnow() {
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
     ESP_ERROR_CHECK(esp_wifi_start());
-    ESP_ERROR_CHECK(esp_wifi_set_channel(DB_PARAM_CHANNEL, WIFI_SECOND_CHAN_NONE));
+    ESP_ERROR_CHECK(esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE));
     ESP_ERROR_CHECK(esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_LR));
     // Explicitly request maximum TX power (units of 0.25 dBm -> 80 = 20 dBm, the
     // EU 2.4 GHz EIRP limit and this build's CONFIG_ESP_PHY_MAX_WIFI_TX_POWER).
@@ -483,6 +484,13 @@ void db_init_wifi_espnow() {
     }
     ESP_LOGI(TAG, "Enabled ESP-NOW WiFi Mode! LR Mode is set. This device will be invisible to non-ESP32 devices!");
     ESP_ERROR_CHECK(esp_read_mac(LOCAL_MAC_ADDRESS, ESP_MAC_WIFI_STA));
+}
+
+/**
+ * Initialize Wi-Fi for regular ESP-NOW operation using the configured channel.
+ */
+void db_init_wifi_espnow() {
+    db_init_wifi_espnow_channel(DB_PARAM_CHANNEL);
 }
 
 /**
@@ -534,9 +542,7 @@ void db_set_radio_status(uint8_t enable_wifi) {
 void db_write_settings_to_nvs() {
     // print parameters to console for logging
     ESP_LOGI(TAG, "Trying to save parameters:");
-    uint8_t param_str_buffer[512] = {0};
-    db_param_print_values_to_buffer(param_str_buffer);
-    ESP_LOGI(TAG, "%s", param_str_buffer);
+    db_param_log_values();
     ESP_LOGI(TAG, "Saving to NVS %s", NVS_NAMESPACE);
     nvs_handle_t my_handle;
     ESP_ERROR_CHECK(nvs_open(NVS_NAMESPACE, NVS_READWRITE, &my_handle));
@@ -604,18 +610,15 @@ void db_read_settings_nvs() {
         db_write_settings_to_nvs();
 
         // Print parameters to console for logging
-        uint8_t param_str_buffer[512] = {0};
-        db_param_print_values_to_buffer(param_str_buffer);
-        ESP_LOGI(TAG, "Initialized with default values:\n%s", (char *)param_str_buffer);
+        ESP_LOGI(TAG, "Initialized with default values:");
+        db_param_log_values();
     } else {
         ESP_LOGI(TAG, "Reading settings from NVS");
         db_param_read_all_params_nvs(&my_handle);
         nvs_close(my_handle);
 
         // print parameters to console for logging
-        uint8_t param_str_buffer[512] = {0};
-        db_param_print_values_to_buffer(param_str_buffer);
-        ESP_LOGI(TAG, "%s", (char *) param_str_buffer);
+        db_param_log_values();
 
         // Check if we have a saved UDP client from the last session. Add it to the known udp clients if there is one.
         if (strlen((char *) db_param_udp_client_ip.value.db_param_str.value) > 0 &&
@@ -648,6 +651,10 @@ void db_read_settings_nvs() {
  * @param arg
  */
 void short_press_callback(void *arg, void *usr_data) {
+    if (db_espnow_binding_request_stop()) {
+        ESP_LOGI(TAG, "Ending ESP-NOW GND group binding session");
+        return;
+    }
     ESP_LOGW(TAG, "Short press detected setting wifi mode to access point with password: dronebridge");
     DB_RADIO_MODE_DESIGNATED = DB_WIFI_MODE_AP;  // Do not directly change DB_PARAM_RADIO_MODE since it is not safe and constantly processed by other tasks. Save settings and reboot will assign DB_RADIO_MODE_DESIGNATED to DB_PARAM_RADIO_MODE.
     db_param_set_to_default(&db_param_ssid);
@@ -663,10 +670,65 @@ void short_press_callback(void *arg, void *usr_data) {
  */
 void long_press_callback(void *arg, void *usr_data) {
     ESP_LOGW(TAG, "Reset triggered via GPIO %i. Resetting settings and rebooting", DB_RESET_PIN);
+    db_espnow_binding_cancel();
     DB_RADIO_MODE_DESIGNATED = DB_WIFI_MODE_AP;  // Do not directly change DB_PARAM_RADIO_MODE since it is not safe and constantly processed by other tasks. Save settings and reboot will assign DB_RADIO_MODE_DESIGNATED to DB_PARAM_RADIO_MODE.
     db_param_reset_all();
     db_write_settings_to_nvs();
     esp_restart();
+}
+
+/**
+ * Requests a GND-side ESP-NOW binding session and reboots into the dedicated binding runtime.
+ *
+ * @param arg Button callback argument.
+ * @param usr_data Application callback data.
+ */
+void double_click_callback(void *arg, void *usr_data) {
+    if (db_espnow_binding_is_active()) {
+        ESP_LOGI(TAG, "Ignoring GND add request while binding is active");
+        return;
+    }
+    if (db_espnow_binding_request(DB_ESPNOW_BIND_ROLE_GND)) {
+        ESP_LOGW(TAG, "ESP-NOW GND binding requested");
+        esp_restart();
+    }
+    ESP_LOGE(TAG, "Failed to request ESP-NOW GND binding");
+}
+
+/**
+ * Requests an AIR-side ESP-NOW binding session and reboots into the dedicated binding runtime.
+ *
+ * @param arg Button callback argument.
+ * @param usr_data Application callback data.
+ */
+void triple_click_callback(void *arg, void *usr_data) {
+    if (db_espnow_binding_is_active()) {
+        ESP_LOGI(TAG, "Ignoring AIR bind request while binding is active");
+        return;
+    }
+    if (db_espnow_binding_request(DB_ESPNOW_BIND_ROLE_AIR)) {
+        ESP_LOGW(TAG, "ESP-NOW AIR binding requested");
+        esp_restart();
+    }
+    ESP_LOGE(TAG, "Failed to request ESP-NOW AIR binding");
+}
+
+/**
+ * Requests a GND group replacement session that rotates the ESP-NOW secret before binding AIR units.
+ *
+ * @param arg Button callback argument.
+ * @param usr_data Application callback data.
+ */
+void four_click_callback(void *arg, void *usr_data) {
+    if (db_espnow_binding_is_active()) {
+        ESP_LOGI(TAG, "Ignoring GND group replacement request while binding is active");
+        return;
+    }
+    if (db_espnow_binding_request_new_group()) {
+        ESP_LOGW(TAG, "ESP-NOW GND new-group binding requested");
+        esp_restart();
+    }
+    ESP_LOGE(TAG, "Failed to request ESP-NOW GND new-group binding");
 }
 
 /**
@@ -687,19 +749,42 @@ void set_reset_trigger() {
         ESP_LOGE(TAG, "Button create failed");
     } else {
         iot_button_register_cb(gpio_btn, BUTTON_SINGLE_CLICK, NULL, short_press_callback, NULL);
+        iot_button_register_cb(gpio_btn, BUTTON_DOUBLE_CLICK, NULL, double_click_callback, NULL);
+        button_event_args_t triple_click_args = {.multiple_clicks.clicks = 3};
+        iot_button_register_cb(gpio_btn, BUTTON_MULTIPLE_CLICK, &triple_click_args, triple_click_callback, NULL);
+        button_event_args_t four_click_args = {.multiple_clicks.clicks = 4};
+        iot_button_register_cb(gpio_btn, BUTTON_MULTIPLE_CLICK, &four_click_args, four_click_callback, NULL);
         iot_button_register_cb(gpio_btn, BUTTON_LONG_PRESS_UP, NULL, long_press_callback, NULL);
     }
 }
 
 
 /**
- * For simple debugging when serial via JTAG is enabled. Printed once control module configured USB serial socket.
- * Write settings to JTAG/USB, so we can debug issues better
+ * Writes one formatted parameter line to the configured serial interface.
+ *
+ * @param line Formatted parameter line to write.
+ * @param line_length Number of bytes in line.
+ * @param context Unused callback context.
+ * @return true when the line was accepted for serial output.
+ */
+static bool db_jtag_serial_write_parameter_line(const uint8_t *line, const size_t line_length, void *context) {
+    (void) context;
+    if (line == NULL || line_length == 0U) {
+        return false;
+    }
+    write_to_serial(line, (unsigned int) line_length);
+    return true;
+}
+
+/**
+ * Streams settings to JTAG/USB after the serial interface has been configured.
  */
 void db_jtag_serial_info_print() {
-    uint8_t buffer[512];
-    const int len = db_param_print_values_to_buffer(buffer);
-    write_to_serial(buffer, len);
+    static const uint8_t prefix[] = "\n";
+    write_to_serial(prefix, sizeof(prefix) - 1U);
+    if (!db_param_stream_values(db_jtag_serial_write_parameter_line, NULL)) {
+        ESP_LOGE(TAG, "Unable to write all parameter values to JTAG");
+    }
 }
 
 /**
@@ -763,6 +848,10 @@ void app_main() {
     set_reset_trigger();
     db_configure_antenna();
     db_status_led_init();
+
+    if (db_espnow_binding_start_if_requested()) {
+        return;
+    }
 
     switch (DB_PARAM_RADIO_MODE) {
         case DB_WIFI_MODE_AP:

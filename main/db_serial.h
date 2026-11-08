@@ -20,9 +20,11 @@
 #ifndef DB_ESP32_DB_SERIAL_H
 #define DB_ESP32_DB_SERIAL_H
 
+#include <stdbool.h>
+
 #include "msp_ltm_serial.h"
 #include "db_esp32_control.h"
-#include "lib/fastmavlink_types.h"
+#include "db_mavlink_parser.h"
 
 #define UART_NUM UART_NUM_1             // The UART interface of the ESP32 we use
 #define DB_SERIAL_READ_TIMEOUT_MS_DEFAULT  50      // Serial read timeout for transparent and MAVLink mode, after that the packet will be sent over the air even when the max. packet size was not reached.
@@ -43,7 +45,7 @@ typedef union {
 } float_int_union;
 
 extern fmav_status_t fmav_status_serial;    // fmav parser status struct for parser handling serial interface
-extern fmav_status_t fmav_status_radio; // fmav parser status struct for parser handling the radio/ESPNOW/WiFi/BLE interface
+extern fmav_status_t fmav_status_radio; // transmit sequence state for generated radio MAVLink messages
 
 int open_serial_socket();
 int db_read_serial(uint8_t *uart_read_buf, uint length);
@@ -54,7 +56,8 @@ void db_parse_msp_ltm(int tcp_clients[], udp_conn_list_t *udp_connection, uint8_
 void db_read_serial_parse_mavlink(int *tcp_clients, udp_conn_list_t *udp_conns, uint8_t *serial_buffer, unsigned int *serial_buff_pos);
 void db_read_serial_parse_transparent(int tcp_clients[], udp_conn_list_t *udp_connection, uint8_t serial_buffer[],
                                       unsigned int *serial_read_bytes);
-void db_parse_mavlink_from_radio(int *tcp_clients, udp_conn_list_t *udp_conns, uint8_t *buffer, int bytes_read);
+void db_parse_mavlink_from_radio(int *tcp_clients, udp_conn_list_t *udp_conns, uint8_t *buffer, int bytes_read,
+                                 db_mavlink_parser_t *parser, bool allow_local_endpoint_handling);
 void db_route_mavlink_response(uint8_t *buffer, uint16_t length, enum DB_MAVLINK_DATA_ORIGIN origin, int *tcp_clients,
                                udp_conn_list_t *udp_conns);
 

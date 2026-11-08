@@ -27,19 +27,30 @@
 #include <driver/gpio.h>
 #include "common/common.h"
 
-#define DB_BUILD_VERSION 19
+/**
+ * Consumes one formatted parameter line emitted by db_param_stream_values().
+ *
+ * @param line Formatted parameter line, including its trailing newline.
+ * @param line_length Number of bytes in line, excluding a string terminator.
+ * @param context Caller-owned context passed through unchanged.
+ * @return true to continue streaming or false to stop streaming.
+ */
+typedef bool (*db_param_output_callback_t)(const uint8_t *line, size_t line_length, void *context);
+
+#define DB_BUILD_VERSION 23
 #define DB_MAJOR_VERSION 2
-#define DB_MINOR_VERSION 2
+#define DB_MINOR_VERSION 4
 #define DB_PATCH_VERSION 1
 #define DB_MATURITY_VERSION "stable"
 #define DB_TYPE_VERSION 255 // FIRMWARE_VERSION_TYPE_OFFICIAL -> https://mavlink.io/en/messages/common.html#FIRMWARE_VERSION_TYPE
 
-#define DB_PARAM_TOTAL_NUM          25  // total number of db parameters
-#define DB_PARAM_MAV_CNT            17  // Number of MAVLink parameters returned by ESP32 in the PARAM message. Needed by GCS.
+#define DB_PARAM_TOTAL_NUM          27  // total number of db parameters
+#define DB_PARAM_MAV_CNT            18  // Number of MAVLink parameters returned by ESP32 in the PARAM message. Needed by GCS.
 
 #define DB_PARAM_NAME_MAXLEN        16      // max len of a parameter/key stored in the ESP32 NVM
 #define DB_PARAM_MAX_MAV_PARAM_NAME_LEN 16  // max len of the field used to store the mav param name (max len 16 by def.)
 #define DB_PARAM_VALUE_MAXLEN       64      // max len of a value stored for a key in the ESP32 NVM (string len)
+#define DB_SERIAL_PACK_SIZE_MAX     1023U   // maximum configured serial packet size; keep below UART_BUF_SIZE
 #define MAX_LTM_FRAMES_IN_BUFFER    5
 
 
@@ -74,6 +85,7 @@
 /* ---------- Optional Macros for quick access to param values ---------- */
 #define DB_PARAM_WIFI_SSID (char *) db_param_ssid.value.db_param_str.value
 #define DB_PARAM_PASS (char *) db_param_pass.value.db_param_str.value
+#define DB_PARAM_ESPNOW_LINK_SECRET ((char *) db_param_espnow_link_secret.value.db_param_str.value)
 #define DB_PARAM_CHANNEL db_param_channel.value.db_param_u8.value
 #define DB_PARAM_RADIO_MODE db_param_radio_mode.value.db_param_u8.value
 #define DB_PARAM_STA_IP db_param_wifi_sta_ip.value.db_param_str.value
@@ -91,6 +103,7 @@
 #define DB_PARAM_GPIO_CTS db_param_gpio_cts.value.db_param_u8.value
 #define DB_PARAM_SERIAL_RTS_THRESH db_param_gpio_rts_thresh.value.db_param_u8.value
 #define DB_PARAM_EN_EXT_ANT db_param_radio_ant_ext.value.db_param_u8.value
+#define DB_PARAM_ESPNOW_AIR2AIR db_param_espnow_air2air.value.db_param_u8.value
 
 enum E_DB_WIFI_MODE {
   DB_WIFI_MODE_AP         = 1, // Wi-Fi access point mode with 802.11b mode enabled
@@ -147,7 +160,7 @@ typedef struct db_parameter_str_s {
     uint8_t *value;
     uint8_t *default_value;
     uint8_t min_len;    // valid if >= min_len
-    uint8_t max_len;    // valid if <= max_len
+    uint8_t max_len;    // allocated capacity including NUL; valid string length is < max_len
 } db_param_str_t;
 
 typedef struct db_parameter_u8_s {
@@ -199,6 +212,7 @@ extern db_parameter_t *db_params[DB_PARAM_TOTAL_NUM];
 
 extern db_parameter_t db_param_ssid;
 extern db_parameter_t db_param_pass;
+extern db_parameter_t db_param_espnow_link_secret;
 extern db_parameter_t db_param_wifi_ap_ip;
 extern db_parameter_t db_param_wifi_sta_ip;
 extern db_parameter_t db_param_wifi_sta_gw;
@@ -222,11 +236,13 @@ extern db_parameter_t db_param_ltm_per_packet;
 extern db_parameter_t db_param_dis_radio_armed;
 extern db_parameter_t db_param_udp_client_port;
 extern db_parameter_t db_param_rssi_dbm;
+extern db_parameter_t db_param_espnow_air2air;
 
 void db_param_init_parameters();
 void db_param_set_to_default(db_parameter_t *db_parameter);
 void db_param_reset_all();
-int db_param_print_values_to_buffer(uint8_t *str_buffer);
+bool db_param_stream_values(db_param_output_callback_t output_callback, void *context);
+void db_param_log_values();
 void db_param_read_all_params_nvs(const nvs_handle_t *nvs_handle);
 void db_param_write_all_params_nvs(const nvs_handle_t *nvs_handle);
 void db_param_read_all_params_json(const cJSON *root_obj);

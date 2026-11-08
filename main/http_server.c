@@ -32,6 +32,7 @@
 #include "globals.h"
 #include "main.h"
 #include "db_serial.h"
+#include "db_espnow_binding.h"
 
 #define TAG "DB_HTTP_REST"
 #define REST_CHECK(a, str, goto_tag, ...)                                              \
@@ -187,6 +188,30 @@ static esp_err_t settings_post_handler(httpd_req_t *req) {
 }
 
 /**
+ * Generates and persists a replacement ESP-NOW group secret for the web interface.
+ *
+ * @param req HTTP request that triggered the rotation.
+ * @return ESP_OK when the new secret was saved and returned.
+ */
+static esp_err_t settings_espnow_secret_rotate_post_handler(httpd_req_t *req) {
+    if (!db_espnow_binding_rotate_secret()) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to rotate ESP-NOW secret");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "status", "success");
+    cJSON_AddStringToObject(root, "msg", "ESP-NOW link secret rotated. Rebind all AIR units before using ESP-NOW.");
+    cJSON_AddStringToObject(root, "espnow_secret", (const char *) DB_PARAM_ESPNOW_LINK_SECRET);
+    const char *response = cJSON_PrintUnformatted(root);
+    db_http_resp_sendstr_with_retry(req, response);
+    free((void *) response);
+    cJSON_Delete(root);
+    return ESP_OK;
+}
+
+/**
  * Process incoming UDP connection add request. Only one IPv4 connection can be added at a time
  * Expecting JSON in the form of:
  * {
@@ -216,18 +241,29 @@ static esp_err_t settings_clients_udp_post(httpd_req_t *req) {
     }
     buf[total_len] = '\0';
 
-    // Obtain & process JSON from request
+    // Validate the complete JSON request before changing the UDP client list.
     cJSON *root = cJSON_Parse(buf);
+    if (!cJSON_IsObject(root)) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid JSON object");
+        return ESP_FAIL;
+    }
 
-    int new_udp_port = 0;
+    cJSON *ip_json = cJSON_GetObjectItem(root, (char *) db_param_udp_client_ip.db_name);
+    cJSON *port_json = cJSON_GetObjectItem(root, (char *) db_param_udp_client_port.db_name);
+    if (!cJSON_IsString(ip_json) || ip_json->valuestring == NULL ||
+        strlen(ip_json->valuestring) >= IP4ADDR_STRLEN_MAX || !cJSON_IsNumber(port_json) ||
+        port_json->valuedouble < 1 || port_json->valuedouble > UINT16_MAX ||
+        port_json->valuedouble != port_json->valueint) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid UDP client");
+        return ESP_FAIL;
+    }
+
     char new_ip[IP4ADDR_STRLEN_MAX];
+    strlcpy(new_ip, ip_json->valuestring, sizeof(new_ip));
     uint8_t save_to_nvm = false;
-    cJSON *json = cJSON_GetObjectItem(root, (char *) db_param_udp_client_ip.db_name);
-    if (json) strncpy(new_ip, json->valuestring, sizeof(new_ip));
-    new_ip[IP4ADDR_STRLEN_MAX-1] = '\0';    // to remove warning and to be sure
-    json = cJSON_GetObjectItem(root, (char *) db_param_udp_client_port.db_name);
-    if (json) new_udp_port = json->valueint;
-    json = cJSON_GetObjectItem(root, "save");
+    cJSON *json = cJSON_GetObjectItem(root, "save");
     if (json && cJSON_IsBool(json)) {
         if(cJSON_IsTrue(json)) {
             save_to_nvm = true;
@@ -240,8 +276,12 @@ static esp_err_t settings_clients_udp_post(httpd_req_t *req) {
     struct sockaddr_in new_sockaddr;
     memset(&new_sockaddr, 0, sizeof(new_sockaddr));
     new_sockaddr.sin_family = AF_INET;
-    inet_pton(AF_INET, new_ip, &new_sockaddr.sin_addr);
-    new_sockaddr.sin_port = htons(new_udp_port);
+    if (inet_pton(AF_INET, new_ip, &new_sockaddr.sin_addr) != 1) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid IPv4 address");
+        return ESP_FAIL;
+    }
+    new_sockaddr.sin_port = htons((uint16_t) port_json->valueint);
     struct db_udp_client_t new_udp_client = {
             .udp_client = new_sockaddr,
             .mac = {0, 0, 0, 0, 0, 0}   // dummy MAC
@@ -472,6 +512,14 @@ esp_err_t start_rest_server(const char *base_path) {
             .user_ctx = rest_context
     };
     httpd_register_uri_handler(server, &settings_post_uri);
+
+    httpd_uri_t settings_espnow_secret_rotate_post_uri = {
+            .uri = "/api/settings/espnow-secret/rotate",
+            .method = HTTP_POST,
+            .handler = settings_espnow_secret_rotate_post_handler,
+            .user_ctx = rest_context
+    };
+    httpd_register_uri_handler(server, &settings_espnow_secret_rotate_post_uri);
 
     /* URI handler for adding a new udp client connection */
     httpd_uri_t settings_clients_udp_post_uri = {
