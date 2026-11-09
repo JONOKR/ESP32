@@ -49,6 +49,9 @@ typedef struct {
     int8_t air_noise_floor;     // [dBm] Noise floor on air side. Updated when ESP32 is in ESP-NOW mode and receives packet - Not supported by all ESP32 variants
     int8_t gnd_noise_floor;     // [dBm] AP/GND told the noise floor he is seeing when receiving our packets. Updated on every DroneBridge internal telemetry frame from GND - Not supported by all ESP32 variants
     uint16_t gnd_rx_packets_lost;   // Number of ESP-NOW packets the GND station lost coming from this AIR peer (based on seq. number)
+    uint16_t air_rx_packets_lost;   // Number of ESP-NOW packets THIS AIR unit lost coming from the GND (based on seq. number). The uplink mirror of gnd_rx_packets_lost - see db_espnow_count_uplink_loss()
+    uint32_t air_last_seq_num;      // Last sequence number seen from the GND. Bookkeeping for the gap arithmetic, not a reportable quality metric
+    uint8_t air_seq_initialised;    // 0 until the first GND packet is seen, so joining a GND that is already running does not count its whole history as lost
 } db_esp_signal_quality_t;
 
 void db_start_control_module();

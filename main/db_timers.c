@@ -115,6 +115,19 @@ void db_timer_start_mavlink_heartbeat() {
 
 /**
  * Timer callback to send a Radio Status Message to the GND in case MAVLink is set as serial protocol
+ *
+ * Carries the loss count for BOTH directions, which is the only place the GCS can see
+ * them side by side:
+ *   - `.rxerrors` - ESP-NOW packets the GND lost coming from this AIR unit (downlink),
+ *     counted by the GND and sent back to us in its internal telemetry frame;
+ *   - `.fixed`    - ESP-NOW packets THIS AIR unit lost coming from the GND (uplink),
+ *     counted locally by db_espnow_count_uplink_loss().
+ * Both are cumulative since boot and saturate instead of wrapping, so the GCS reads
+ * them as deltas over a window. `.fixed` nominally means "error-corrected packets" in
+ * MAVLink; it is reused because it is the only unused 16-bit field in the message and
+ * `.txbuf` cannot be touched - some ground stations throttle their streams when txbuf
+ * reports a full buffer, which would silently change the link under test.
+ *
  * @param pxTimer
  */
 void db_timer_mavlink_radiostatus_callback(TimerHandle_t pxTimer) {
@@ -130,12 +143,13 @@ void db_timer_mavlink_radiostatus_callback(TimerHandle_t pxTimer) {
     if (DB_PARAM_RADIO_MODE == DB_WIFI_MODE_STA || DB_PARAM_RADIO_MODE == DB_WIFI_MODE_ESPNOW_AIR ||
         DB_PARAM_RADIO_MODE == DB_BLUETOOTH_MODE) {
         // ToDo: For BLE only the last connected client is considered.
-        fmav_radio_status_t payload_r = {.fixed = 0, .txbuf=0,
+        fmav_radio_status_t payload_r = {.txbuf=0,
                 .noise = db_esp_signal_quality.gnd_noise_floor,
                 .remnoise = db_esp_signal_quality.air_noise_floor,
                 .remrssi = db_format_rssi(db_esp_signal_quality.air_rssi, db_esp_signal_quality.air_noise_floor),
                 .rssi = db_format_rssi(db_esp_signal_quality.gnd_rssi, db_esp_signal_quality.gnd_noise_floor),
-                .rxerrors = db_esp_signal_quality.gnd_rx_packets_lost};
+                .rxerrors = db_esp_signal_quality.gnd_rx_packets_lost,
+                .fixed = db_esp_signal_quality.air_rx_packets_lost};
         uint16_t len = fmav_msg_radio_status_encode_to_frame_buf(buff, db_get_mav_sys_id(),
                                                                  db_get_mav_comp_id(), &payload_r,
                                                                  &fmav_status_radio);

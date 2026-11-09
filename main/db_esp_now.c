@@ -284,6 +284,53 @@ bool db_read_uart_queue_and_send() {
 }
 
 /**
+ * Count ESP-NOW packets lost on the uplink (GND -> AIR) from gaps in the sender's sequence number.
+ *
+ * The mirror of the GND's own accounting in db_espnow_process_rcv_data(), for the one
+ * direction nothing in this stack measured until now. Every packet carries a seq_num the
+ * sender increments once per send, so a jump of more than one means the difference never
+ * arrived. The running total reaches the GCS in RADIO_STATUS.fixed, beside the downlink's
+ * count in .rxerrors - see db_timer_mavlink_radiostatus_callback().
+ *
+ * **Why this exists.** On 2026-11-07 an ESP-NOW unicast change killed the uplink outright
+ * while the downlink stayed perfect, and because no counter watched this direction the
+ * symptom was indistinguishable from the dead AIR->FC UART wire found the day before.
+ * That cost a day. "The GND is not heard at all" and "the GND is heard fine but the FC
+ * ignores its commands" are unrelated faults, and this is what separates them. It also
+ * means a walk-away range test measures both directions instead of guessing that the link
+ * is symmetric.
+ *
+ * Only the GND is counted. An AIR unit can hear sibling AIR units, whose sequence numbers
+ * come from a different sender and would corrupt the arithmetic; the caller guarantees
+ * origin == DB_ESPNOW_ORIGIN_GND.
+ *
+ * @param seq_num Sequence number from the header of the packet just received from the GND
+ */
+static void db_espnow_count_uplink_loss(const uint32_t seq_num) {
+    if (!db_esp_signal_quality.air_seq_initialised) {
+        /* First packet from this GND. Adopt its position in the sequence instead of
+         * treating everything the GND sent before we were listening as lost - an AIR unit
+         * powered up beside a running GND would otherwise report tens of thousands of
+         * lost packets and discredit the counter on sight. */
+        db_esp_signal_quality.air_seq_initialised = 1;
+    } else if (seq_num > db_esp_signal_quality.air_last_seq_num) {
+        const uint32_t lost = (uint32_t) db_esp_signal_quality.air_rx_packets_lost +
+                              (seq_num - db_esp_signal_quality.air_last_seq_num - 1);
+        /* Saturate rather than wrap: the GCS reads this as a delta, and a counter pinned
+         * at the top still reads as "losing everything" where a wrapped one would look
+         * briefly healthy. */
+        db_esp_signal_quality.air_rx_packets_lost = (lost > UINT16_MAX) ? UINT16_MAX : (uint16_t) lost;
+    } else {
+        /* Sequence went backwards: the GND rebooted and restarted at 0, or this is a
+         * replayed frame. Same choice the GND makes for its own direction - resynchronise
+         * and keep the link usable rather than discard a packet that decrypted correctly. */
+        ESP_LOGW(TAG, "Uplink sequence number lower than expected. GND did reset or packet may be part of a replay attack.");
+        db_esp_signal_quality.air_rx_packets_lost = 0;
+    }
+    db_esp_signal_quality.air_last_seq_num = seq_num;
+}
+
+/**
  * Add a new ESP-NOW broadcast peer to the list of known ESP-NOW peers. Checks if peer is already known based on MAC.
  * List is then used to keep track of the RSSI, packet loss and signal quality on GND side.
  *
@@ -378,6 +425,7 @@ void db_espnow_process_rcv_data(uint8_t *data, uint16_t data_len, uint8_t *src_a
             // AIR link quality must describe the GND link, never a neighbouring AIR peer.
             db_esp_signal_quality.air_rssi = rssi;
             db_esp_signal_quality.air_noise_floor = noise_floor;
+            db_espnow_count_uplink_loss(db_esp_now_packet->db_esp_now_packet_header.seq_num);
         }
 
         /* Process packet depending on packet type */
