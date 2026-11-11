@@ -458,6 +458,30 @@ db_parameter_t db_param_espnow_air2air = {
 };
 
 /**
+ * ESP-NOW addressing mode: 0 broadcast everything, 1 control frames addressed, 2 all addressed.
+ *
+ * Defaults to 0, which is byte-for-byte the behaviour this firmware has always had.
+ * See db_parameters.h for what the modes mean and why the default is off.
+ */
+db_parameter_t db_param_espnow_unicast = {
+        .db_name = "espnow_unicast",
+        .type = UINT8,
+        .mav_t = {
+                .param_name = "ESPNOW_UNICAST",
+                .param_index = 18,
+                .param_type = MAV_PARAM_TYPE_UINT8,
+        },
+        .value = {
+                .db_param_u8 = {
+                        .value = DB_ESPNOW_UNICAST_OFF,
+                        .default_value = DB_ESPNOW_UNICAST_OFF,
+                        .min = DB_ESPNOW_UNICAST_OFF,
+                        .max = DB_ESPNOW_UNICAST_ALL,
+                }
+        }
+};
+
+/**
  * Array containing all references to the DB parameters assigned with db_param_init_parameters()
  */
 db_parameter_t *db_params[DB_PARAM_TOTAL_NUM] = {NULL};
@@ -567,7 +591,8 @@ void db_param_init_parameters() {
             &db_param_dis_radio_armed,
             &db_param_udp_client_port,
             &db_param_rssi_dbm,
-            &db_param_espnow_air2air
+            &db_param_espnow_air2air,
+            &db_param_espnow_unicast
     };
     memcpy(db_params, db_params_l, sizeof(db_params_l));
 }

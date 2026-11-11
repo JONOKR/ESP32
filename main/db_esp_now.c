@@ -45,6 +45,10 @@ QueueHandle_t db_espnow_send_queue;    // Queue that contains data to be sent vi
 QueueHandle_t db_uart_write_queue;    // Queue that contains data to be written to UART (filled by ESP-NOW task)
 static db_esp_now_clients_list_t *db_esp_now_clients_list;
 
+/* Forward declaration: the send path below needs this, and it is defined further down
+ * beside the peer bookkeeping it reads. */
+static const uint8_t *db_espnow_unicast_target(void);
+
 /**
  * Read-only view of the ESP-NOW peer list - see db_esp_now.h for why this
  * exists instead of an `extern`.
@@ -226,7 +230,13 @@ bool db_espnow_encrypt_auth_send(db_esp_now_packet_t *db_esp_now_packet, const u
     // const uint8_t payload_length = db_esp_now_packet->db_esp_now_packet_protected_data.payload_length_decrypted;
     ret = db_encrypt_payload(db_esp_now_packet, db_esp_now_packet->db_esp_now_packet_protected_data.payload_length_decrypted + 1);
     if (ret == 0) {
-        err = esp_now_send(BROADCAST_MAC, (const uint8_t *) db_esp_now_packet, (db_esp_now_packet_header_len + DB_ESPNOW_AES_TAG_LEN + payload_length + 1));
+        /* Addressed to the peer when one is known and the mode asks for it, so the WiFi
+         * MAC acknowledges and retransmits it; broadcast otherwise. */
+        const uint8_t *dest = db_espnow_unicast_target();
+        if (dest == NULL) {
+            dest = BROADCAST_MAC;
+        }
+        err = esp_now_send(dest, (const uint8_t *) db_esp_now_packet, (db_esp_now_packet_header_len + DB_ESPNOW_AES_TAG_LEN + payload_length + 1));
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "Error (%s) sending ESP-NOW data - size %i !", esp_err_to_name(err), (db_esp_now_packet_header_len + DB_ESPNOW_AES_TAG_LEN + payload_length + 1));
             return false;
@@ -281,6 +291,105 @@ bool db_read_uart_queue_and_send() {
 
     }
     return false;
+}
+
+/* MAC of the GND station as learnt from received packets, and whether it is known.
+ * The AIR side keeps only this one address: it talks to exactly one ground station,
+ * while the GND tracks a whole fleet in db_esp_now_clients_list. Before 2026-11-11 the
+ * AIR side learnt nothing, which is half of why the first unicast attempt failed
+ * asymmetrically - only the GND ever had an address to send to. */
+static uint8_t db_espnow_gnd_mac[ESP_NOW_ETH_ALEN] = {0};
+static bool db_espnow_gnd_mac_known = false;
+
+/**
+ * Register a peer with ESP-NOW so packets can be addressed to it directly.
+ *
+ * Two things here are easy to get wrong and both cost a day the first time.
+ *
+ * **Unencrypted at the ESP-NOW layer, on purpose.** DroneBridge already encrypts and
+ * authenticates every payload itself with AES-GCM, and ESP-NOW's limit on *encrypted*
+ * peers is far below its 20-peer total, which a fleet would hit.
+ *
+ * **The peer's PHY mode must match the interface.** ESP-NOW's default bit rate is 1 Mbps
+ * (802.11b) while this firmware sets the interface to
+ * WIFI_PROTOCOL_11B | WIFI_PROTOCOL_LR, so a peer registered without a rate config can
+ * transmit on a different PHY mode than the link was set up for.
+ * esp_now_set_peer_rate_config() must be called *after* esp_now_add_peer(), and is
+ * pinned here to LR at 250 kbps - the mode this link exists for.
+ *
+ * Failure is never fatal: db_espnow_unicast_target() only offers a peer that is actually
+ * registered, so anything that fails here falls back to broadcast.
+ *
+ * @param peer_mac MAC address of the peer to register
+ * @return true if the peer is registered (or already was), false on error
+ */
+static bool db_espnow_register_peer(const uint8_t peer_mac[ESP_NOW_ETH_ALEN]) {
+    if (esp_now_is_peer_exist(peer_mac)) {
+        return true;
+    }
+    esp_now_peer_info_t peer = {0};
+    memcpy(peer.peer_addr, peer_mac, ESP_NOW_ETH_ALEN);
+    peer.ifidx = WIFI_IF_STA;   // ESP-NOW modes run the radio in STA mode
+    peer.encrypt = false;       // payload is already encrypted by DroneBridge
+    const esp_err_t err = esp_now_add_peer(&peer);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Could not add ESP-NOW peer " MACSTR " (%s) - staying on broadcast for it",
+                 MAC2STR(peer_mac), esp_err_to_name(err));
+        return false;
+    }
+    esp_now_rate_config_t rate = {
+            .phymode = WIFI_PHY_MODE_LR,
+            .rate = WIFI_PHY_RATE_LORA_250K,
+            .ersu = false,
+            .dcm = false,
+    };
+    const esp_err_t rate_err = esp_now_set_peer_rate_config(peer_mac, &rate);
+    if (rate_err != ESP_OK) {
+        /* Not fatal, but worth shouting about: the peer exists and will be used, at
+         * whatever rate the driver picked. If addressed frames do not arrive, this log
+         * line is the first place to look. */
+        ESP_LOGW(TAG, "esp_now_set_peer_rate_config(LR/250K) failed for " MACSTR ": %s",
+                 MAC2STR(peer_mac), esp_err_to_name(rate_err));
+    }
+    ESP_LOGI(TAG, "ESP-NOW peer " MACSTR " registered for addressed sending", MAC2STR(peer_mac));
+    return true;
+}
+
+/**
+ * MAC address to send the next ESP-NOW packet to, or NULL to broadcast it.
+ *
+ * Returns an address only when DB_PARAM_ESPNOW_UNICAST asks for one and exactly one peer
+ * is known, so a default build broadcasts exactly as it always has.
+ *
+ * **Why exactly one peer.** The send path is single-flight - ready_to_send waits for the
+ * send callback so packet order is preserved - and one payload must therefore remain one
+ * esp_now_send() call. With several AIR units a broadcast also reaches all of them in one
+ * airtime slot where N unicasts cost N, on a link whose goodput the whole fleet shares.
+ * Per-destination fan-out needs per-peer queues, which is a larger change.
+ *
+ * The two roles learn their counterpart differently and neither is guaranteed: the GND
+ * fills db_esp_now_clients_list from received packets, the AIR side records the GND's MAC
+ * above. With nothing learnt yet this returns NULL and discovery happens by broadcast,
+ * which is the permanent bootstrap and not an error path.
+ *
+ * @return pointer to the peer's MAC, or NULL if the packet should be broadcast
+ */
+static const uint8_t *db_espnow_unicast_target(void) {
+    if (DB_PARAM_ESPNOW_UNICAST == DB_ESPNOW_UNICAST_OFF) {
+        return NULL;
+    }
+    const uint8_t *mac = NULL;
+    if (DB_PARAM_RADIO_MODE == DB_WIFI_MODE_ESPNOW_AIR) {
+        mac = db_espnow_gnd_mac_known ? db_espnow_gnd_mac : NULL;
+    } else if (db_esp_now_clients_list != NULL && db_esp_now_clients_list->size == 1) {
+        mac = db_esp_now_clients_list->db_esp_now_bpeer_info[0].broadcast_peer_mac;
+    }
+    /* Registration can have failed (peer table full, ESP-NOW not ready when the peer was
+     * first seen); broadcast is the honest fallback. */
+    if (mac == NULL || !esp_now_is_peer_exist(mac)) {
+        return NULL;
+    }
+    return mac;
 }
 
 /**
@@ -356,6 +465,9 @@ int16_t update_peer_list(db_esp_now_clients_list_t *esp_now_clients, uint8_t bro
         memcpy(db_esp_now_bpeer_info.broadcast_peer_mac, broadcast_peer_mac, ESP_NOW_ETH_ALEN);
         esp_now_clients->db_esp_now_bpeer_info[esp_now_clients->size] = db_esp_now_bpeer_info;
         esp_now_clients->size++; // Increment the size of the list
+        /* Register with ESP-NOW too, so packets can be addressed to this peer when
+         * DB_PARAM_ESPNOW_UNICAST asks for it. Harmless while broadcasting. */
+        db_espnow_register_peer(broadcast_peer_mac);
         return (esp_now_clients->size-1) ;
     }
 }
@@ -426,6 +538,15 @@ void db_espnow_process_rcv_data(uint8_t *data, uint16_t data_len, uint8_t *src_a
             db_esp_signal_quality.air_rssi = rssi;
             db_esp_signal_quality.air_noise_floor = noise_floor;
             db_espnow_count_uplink_loss(db_esp_now_packet->db_esp_now_packet_header.seq_num);
+            /* Learn the ground station's address so replies can be addressed to it. The
+             * AIR side learnt nothing before 2026-11-11, which is why the first unicast
+             * attempt went one way only. Re-register whenever the MAC changes - a
+             * different GND, or the very first packet. */
+            if (!db_espnow_gnd_mac_known ||
+                memcmp(db_espnow_gnd_mac, src_addr, ESP_NOW_ETH_ALEN) != 0) {
+                memcpy(db_espnow_gnd_mac, src_addr, ESP_NOW_ETH_ALEN);
+                db_espnow_gnd_mac_known = db_espnow_register_peer(db_espnow_gnd_mac);
+            }
         }
 
         /* Process packet depending on packet type */
@@ -538,10 +659,15 @@ static void db_espnow_receive_callback(const esp_now_recv_info_t *recv_info, con
         return;
     }
 
-    if (!IS_BROADCAST_ADDR(des_addr)) {
-        ESP_LOGD(TAG, "Receive uni-cast ESP-NOW data. Ignoring");
-        return;
-    }
+    /* Addressed (unicast) frames are accepted as of 2026-11-11. Upstream rejected
+     * them here because it only ever broadcast, and that one early return is what made
+     * the 2026-11-07 unicast attempt fail: the send side was switched over while every
+     * addressed frame was still discarded at the peer, before it was even decrypted.
+     * Accepting them is safe - the payload is AES-GCM authenticated below, so a forged
+     * frame gets no further whatever its destination address. See
+     * docs/decisions/2026-11-10-link-reliability-architecture.md.
+     * des_addr is still read above; kept because per-destination accounting will want it. */
+    (void) des_addr;
 
     // The header is authenticated later. This early rejection only avoids allocating and queueing known-disallowed traffic.
     if (!db_espnow_origin_is_allowed(data[0])) {
