@@ -482,6 +482,28 @@ db_parameter_t db_param_espnow_unicast = {
 };
 
 /**
+ * PHY rate ESP-NOW transmits at. Separate from ESPNOW_UNICAST on purpose.
+ * See db_parameters.h for why the two must be varied one at a time.
+ */
+db_parameter_t db_param_espnow_rate = {
+        .db_name = "espnow_rate",
+        .type = UINT8,
+        .mav_t = {
+                .param_name = "ESPNOW_RATE",
+                .param_index = 19,
+                .param_type = MAV_PARAM_TYPE_UINT8,
+        },
+        .value = {
+                .db_param_u8 = {
+                        .value = DB_ESPNOW_RATE_DRIVER_DEFAULT,
+                        .default_value = DB_ESPNOW_RATE_DRIVER_DEFAULT,
+                        .min = DB_ESPNOW_RATE_DRIVER_DEFAULT,
+                        .max = DB_ESPNOW_RATE_LR_500K,
+                }
+        }
+};
+
+/**
  * Array containing all references to the DB parameters assigned with db_param_init_parameters()
  */
 db_parameter_t *db_params[DB_PARAM_TOTAL_NUM] = {NULL};
@@ -592,7 +614,8 @@ void db_param_init_parameters() {
             &db_param_udp_client_port,
             &db_param_rssi_dbm,
             &db_param_espnow_air2air,
-            &db_param_espnow_unicast
+            &db_param_espnow_unicast,
+            &db_param_espnow_rate
     };
     memcpy(db_params, db_params_l, sizeof(db_params_l));
 }

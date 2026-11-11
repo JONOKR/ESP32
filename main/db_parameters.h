@@ -44,7 +44,7 @@ typedef bool (*db_param_output_callback_t)(const uint8_t *line, size_t line_leng
 #define DB_MATURITY_VERSION "stable"
 #define DB_TYPE_VERSION 255 // FIRMWARE_VERSION_TYPE_OFFICIAL -> https://mavlink.io/en/messages/common.html#FIRMWARE_VERSION_TYPE
 
-#define DB_PARAM_TOTAL_NUM          28  // total number of db parameters
+#define DB_PARAM_TOTAL_NUM          29  // total number of db parameters
 #define DB_PARAM_MAV_CNT            18  // Number of MAVLink parameters returned by ESP32 in the PARAM message. Needed by GCS.
 
 #define DB_PARAM_NAME_MAXLEN        16      // max len of a parameter/key stored in the ESP32 NVM
@@ -122,6 +122,32 @@ enum {
     DB_ESPNOW_UNICAST_OFF = 0,      // broadcast everything
     DB_ESPNOW_UNICAST_CONTROL = 1,  // control frames addressed, telemetry broadcast
     DB_ESPNOW_UNICAST_ALL = 2,      // everything addressed - for measurement, not for flying
+};
+
+/**
+ * PHY rate ESP-NOW transmits at, as a parameter so it can be changed
+ * independently of the addressing mode.
+ *
+ * These two must never move together. On 2026-11-11 the LR 250 kbps rate config
+ * was applied inside peer registration, so enabling addressed sending also
+ * dropped the PHY rate 4x. GND->AIR then failed outright while AIR->GND kept
+ * working, and no measurement could say which of the two changes caused it -
+ * the single-flight send path spends up to 7 MAC retries per frame, and the
+ * GND carries the busier direction.
+ *
+ * DRIVER_DEFAULT leaves the rate alone: ESP-NOW's documented default is 1 Mbps
+ * (802.11b), the rate every range number measured before this date was taken
+ * at. The LR settings are the open question of whether
+ * esp_wifi_set_protocol(.. | WIFI_PROTOCOL_LR) alone ever put ESP-NOW data
+ * frames on an LR rate - see memory.md section 5. Set it alone, with
+ * ESPNOW_UNICAST off, and walk the ladder.
+ */
+#define DB_PARAM_ESPNOW_RATE db_param_espnow_rate.value.db_param_u8.value
+
+enum {
+    DB_ESPNOW_RATE_DRIVER_DEFAULT = 0,  // do not call the rate API at all
+    DB_ESPNOW_RATE_LR_250K = 1,         // WIFI_PHY_MODE_LR @ WIFI_PHY_RATE_LORA_250K
+    DB_ESPNOW_RATE_LR_500K = 2,         // WIFI_PHY_MODE_LR @ WIFI_PHY_RATE_LORA_500K
 };
 
 enum E_DB_WIFI_MODE {
@@ -257,6 +283,7 @@ extern db_parameter_t db_param_udp_client_port;
 extern db_parameter_t db_param_rssi_dbm;
 extern db_parameter_t db_param_espnow_air2air;
 extern db_parameter_t db_param_espnow_unicast;
+extern db_parameter_t db_param_espnow_rate;
 
 void db_param_init_parameters();
 void db_param_set_to_default(db_parameter_t *db_parameter);

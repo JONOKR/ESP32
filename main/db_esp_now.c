@@ -45,9 +45,10 @@ QueueHandle_t db_espnow_send_queue;    // Queue that contains data to be sent vi
 QueueHandle_t db_uart_write_queue;    // Queue that contains data to be written to UART (filled by ESP-NOW task)
 static db_esp_now_clients_list_t *db_esp_now_clients_list;
 
-/* Forward declaration: the send path below needs this, and it is defined further down
- * beside the peer bookkeeping it reads. */
+/* Forward declarations: the send path below needs these, and they are defined further
+ * down beside the peer bookkeeping they read. */
 static const uint8_t *db_espnow_unicast_target(void);
+static void db_espnow_sync_rate_config(void);
 
 /**
  * Read-only view of the ESP-NOW peer list - see db_esp_now.h for why this
@@ -230,6 +231,9 @@ bool db_espnow_encrypt_auth_send(db_esp_now_packet_t *db_esp_now_packet, const u
     // const uint8_t payload_length = db_esp_now_packet->db_esp_now_packet_protected_data.payload_length_decrypted;
     ret = db_encrypt_payload(db_esp_now_packet, db_esp_now_packet->db_esp_now_packet_protected_data.payload_length_decrypted + 1);
     if (ret == 0) {
+        /* Pick up a changed ESPNOW_RATE before sending, so the parameter and the radio
+         * cannot disagree (there is no reboot command to fall back on). */
+        db_espnow_sync_rate_config();
         /* Addressed to the peer when one is known and the mode asks for it, so the WiFi
          * MAC acknowledges and retransmits it; broadcast otherwise. */
         const uint8_t *dest = db_espnow_unicast_target();
@@ -302,6 +306,101 @@ static uint8_t db_espnow_gnd_mac[ESP_NOW_ETH_ALEN] = {0};
 static bool db_espnow_gnd_mac_known = false;
 
 /**
+ * Apply DB_PARAM_ESPNOW_RATE to one already-registered peer.
+ *
+ * Does nothing at all on DRIVER_DEFAULT - deliberately, because "do not call the API"
+ * and "call it with the driver's own default" are not the same thing and only the
+ * former reproduces the behaviour every range measurement before 2026-11-11 was taken
+ * under. The rate therefore never changes unless the parameter asks for it.
+ *
+ * esp_now_set_peer_rate_config() must be called *after* esp_now_add_peer(), and the
+ * interface must already permit the PHY mode (main.c enables WIFI_PROTOCOL_LR) or the
+ * driver rejects the rate.
+ *
+ * Failure is not fatal: the peer stays usable at whatever rate the driver chose, so a
+ * rejected rate degrades to the default rather than losing the link.
+ *
+ * @param peer_mac MAC address of a peer already added to the ESP-NOW peer list
+ * @return true if the requested rate was applied, false if it was rejected
+ */
+/* Value of DB_PARAM_ESPNOW_RATE last pushed to the driver; -1 until the rate API has
+ * been called at all this boot. The distinction matters: "never called" is the state
+ * every range measurement before 2026-11-11 was taken under, and it cannot be recreated
+ * by calling the API with a default-looking argument. */
+static int16_t db_espnow_rate_pushed = -1;
+
+static bool db_espnow_apply_rate_config(const uint8_t peer_mac[ESP_NOW_ETH_ALEN]) {
+    const uint8_t want = DB_PARAM_ESPNOW_RATE;
+    if (want == DB_ESPNOW_RATE_DRIVER_DEFAULT && db_espnow_rate_pushed < 0) {
+        return true;    // untouched since boot - leave the driver's own choice alone
+    }
+    esp_now_rate_config_t rate = {.ersu = false, .dcm = false};
+    switch (want) {
+        case DB_ESPNOW_RATE_LR_250K:
+            rate.phymode = WIFI_PHY_MODE_LR;
+            rate.rate = WIFI_PHY_RATE_LORA_250K;
+            break;
+        case DB_ESPNOW_RATE_LR_500K:
+            rate.phymode = WIFI_PHY_MODE_LR;
+            rate.rate = WIFI_PHY_RATE_LORA_500K;
+            break;
+        default:
+            /* Going back to the default at runtime cannot "un-call" the API, so it is
+             * stated explicitly as ESP-NOW's documented default of 1 Mbps 802.11b. That
+             * is the intent of mode 0, but it is not bit-identical to a boot that never
+             * set a rate - reboot for that. */
+            rate.phymode = WIFI_PHY_MODE_11B;
+            rate.rate = WIFI_PHY_RATE_1M_L;
+            break;
+    }
+    const esp_err_t rate_err = esp_now_set_peer_rate_config(peer_mac, &rate);
+    if (rate_err != ESP_OK) {
+        ESP_LOGW(TAG, "esp_now_set_peer_rate_config(mode %d) rejected for " MACSTR ": %s",
+                 (int) want, MAC2STR(peer_mac), esp_err_to_name(rate_err));
+        return false;
+    }
+    ESP_LOGI(TAG, "ESP-NOW peer " MACSTR " rate set (mode %d)", MAC2STR(peer_mac), (int) want);
+    return true;
+}
+
+/**
+ * Push DB_PARAM_ESPNOW_RATE to every registered peer whenever the parameter has changed.
+ *
+ * Without this the rate would only ever be applied at peer registration, i.e. at boot,
+ * and there is **no MAVLink reboot command in this firmware** - only
+ * MAV_CMD_REQUEST_MESSAGE is handled. Changing the rate would then mean power-cycling
+ * both units, which at a far test position means walking to the aircraft for every step
+ * of a ladder. Worse, the parameter would read back as the new value while the radio kept
+ * transmitting at the old one, so a measurement would quietly describe the wrong rate.
+ *
+ * Cheap enough for the send path: one comparison per packet, and the ESP-NOW calls happen
+ * only on the transition.
+ */
+static void db_espnow_sync_rate_config(void) {
+    const uint8_t want = DB_PARAM_ESPNOW_RATE;
+    if ((int16_t) want == db_espnow_rate_pushed) {
+        return;
+    }
+    if (want == DB_ESPNOW_RATE_DRIVER_DEFAULT && db_espnow_rate_pushed < 0) {
+        return;     // already untouched; nothing to do
+    }
+    db_espnow_rate_pushed = (int16_t) want;     // set first: apply_rate_config reads it
+    db_espnow_apply_rate_config(BROADCAST_MAC);
+    if (DB_PARAM_RADIO_MODE == DB_WIFI_MODE_ESPNOW_AIR) {
+        if (db_espnow_gnd_mac_known) {
+            db_espnow_apply_rate_config(db_espnow_gnd_mac);
+        }
+    } else if (db_esp_now_clients_list != NULL) {
+        for (uint8_t i = 0; i < db_esp_now_clients_list->size &&
+                            i < DB_ESPNOW_MAX_BROADCAST_PEERS; i++) {
+            db_espnow_apply_rate_config(
+                    db_esp_now_clients_list->db_esp_now_bpeer_info[i].broadcast_peer_mac);
+        }
+    }
+    ESP_LOGI(TAG, "ESP-NOW rate mode now %d on all known peers", (int) want);
+}
+
+/**
  * Register a peer with ESP-NOW so packets can be addressed to it directly.
  *
  * Two things here are easy to get wrong and both cost a day the first time.
@@ -337,20 +436,7 @@ static bool db_espnow_register_peer(const uint8_t peer_mac[ESP_NOW_ETH_ALEN]) {
                  MAC2STR(peer_mac), esp_err_to_name(err));
         return false;
     }
-    esp_now_rate_config_t rate = {
-            .phymode = WIFI_PHY_MODE_LR,
-            .rate = WIFI_PHY_RATE_LORA_250K,
-            .ersu = false,
-            .dcm = false,
-    };
-    const esp_err_t rate_err = esp_now_set_peer_rate_config(peer_mac, &rate);
-    if (rate_err != ESP_OK) {
-        /* Not fatal, but worth shouting about: the peer exists and will be used, at
-         * whatever rate the driver picked. If addressed frames do not arrive, this log
-         * line is the first place to look. */
-        ESP_LOGW(TAG, "esp_now_set_peer_rate_config(LR/250K) failed for " MACSTR ": %s",
-                 MAC2STR(peer_mac), esp_err_to_name(rate_err));
-    }
+    db_espnow_apply_rate_config(peer_mac);
     ESP_LOGI(TAG, "ESP-NOW peer " MACSTR " registered for addressed sending", MAC2STR(peer_mac));
     return true;
 }
@@ -780,6 +866,11 @@ esp_err_t db_espnow_init() {
     esp_now_peer_info_t peer = {0};
     memcpy(peer.peer_addr, BROADCAST_MAC, 6);
     if (!esp_now_is_peer_exist(BROADCAST_MAC)) ESP_ERROR_CHECK(esp_now_add_peer(&peer));
+    /* The broadcast MAC is a peer like any other, so the rate applies to it as well.
+     * This is what makes DB_PARAM_ESPNOW_RATE testable on its own: broadcast traffic on
+     * an LR rate, with addressing left alone. Upstream never set a rate for this peer,
+     * which is why it is an open question what rate broadcast has been using. */
+    db_espnow_apply_rate_config(BROADCAST_MAC);
 
     /* Pin the packet size to the ESP-NOW payload limit — in BOTH directions.
      * Every ESP-NOW frame costs a full airtime slot + AES-GCM overhead + a
