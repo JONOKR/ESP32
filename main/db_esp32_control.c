@@ -202,6 +202,11 @@ void db_send_to_all_udp_clients(const uint8_t *data, uint data_length) {
  * Adds a payload to be sent via ESP-NOW to the ESP-NOW queue (where the esp-now task will pick it up, encrypt, package
  * and finally send it over the air)
  *
+ * Drops the payload rather than waiting for a slot: this runs inside
+ * read_process_serial_link(), on the one task that also drains db_uart_write_queue
+ * further down its loop, so blocking here stops the unit serving its serial link at
+ * all. See DB_ESPNOW_DATA_QUEUE_DELAY_MS for the measurement that forced this.
+ *
  * @param data Pointer to the payload buffer
  * @param data_length Length of the payload data. Must not be bigger than DB_ESPNOW_PAYLOAD_MAXSIZE - fails otherwise
  */
@@ -211,8 +216,9 @@ void db_send_to_all_espnow(uint8_t data[], const uint16_t *data_length) {
     memcpy(evt.data, data, *data_length);
     evt.data_len = *data_length;
     evt.packet_type = DB_ESP_NOW_PACKET_TYPE_DATA;
-    if (xQueueSend(db_espnow_send_queue, &evt, ESPNOW_MAXDELAY) != pdTRUE) {
-        ESP_LOGW(TAG, "Send to db_espnow_send_queue queue fail");
+    if (xQueueSend(db_espnow_send_queue, &evt,
+                   pdMS_TO_TICKS(DB_ESPNOW_DATA_QUEUE_DELAY_MS)) != pdTRUE) {
+        ESP_LOGW(TAG, "db_espnow_send_queue full - dropping %u B uplink", *data_length);
         free(evt.data);
     } else {
         // all good

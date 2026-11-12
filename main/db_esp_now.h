@@ -34,7 +34,33 @@
 // payload each. Kept through the v2.4.1 merge on purpose - this link has no
 // retransmission, so an overflow is an unrecoverable loss (memory.md 5.0).
 #define ESPNOW_QUEUE_SIZE   12
+// Blocking budget when enqueueing, in FreeRTOS ticks. CONFIG_FREERTOS_HZ is 1000,
+// so 512 ticks is **512 ms** - which is where this used to be for every queue.
+// Still correct for db_espnow_send_recv_callback_queue: dropping a SEND_CB event
+// would leave ready_to_send false forever and wedge the send path permanently, so
+// that queue must block rather than lose an event.
 #define ESPNOW_MAXDELAY     512
+// ...but the two *data-path* queues must DROP instead of block. Measured
+// 2026-11-12 (memory.md 5.4): with the radio at an LR rate the 12-slot send queue
+// stays full, and a 512 ms xQueueSend inside read_process_serial_link stalled the
+// whole control task for ~370 ms at a time - during which the GND answered neither
+// its own serial nor the downlink queue, because both are served by that one loop.
+// A dropped MAVLink frame is retried by the protocol above; a half-second stall
+// breaks every timer above it (GroundControl's REQUEST_RETRY_S and read_param
+// timeout_s are both 1.0 s). 10 ms absorbs scheduling jitter while staying two
+// orders of magnitude clear of those timers.
+#define DB_ESPNOW_DATA_QUEUE_DELAY_MS 10
+// Peer-list ("internal telemetry") period. This frame is sizeof(db_esp_now_clients_list_t)
+// = 211 B - the whole fixed DB_ESPNOW_MAX_BROADCAST_PEERS array, sent whether one peer
+// is connected or nineteen - i.e. a near-maximum ESP-NOW frame against a 215 B payload
+// limit. It used to be scheduled by a loop-iteration counter rather than a clock, which
+// put it on air at roughly 66 Hz: ~113 kbps of RSSI housekeeping on a link whose measured
+// goodput is 20-50 kbps (memory.md 5.1). 2 Hz is ample for an RSSI display.
+// The frame's *size* is deliberately unchanged: the receiving AIR unit checks the payload
+// length against sizeof(db_esp_now_clients_list_t) exactly, so sending only `size` entries
+// would need both units reflashed in lockstep and would blind the AIR's RADIO_STATUS
+// reporting until that happened. Shrinking it is a follow-up, not part of this change.
+#define DB_ESPNOW_INTERNAL_TELEMETRY_PERIOD_US 500000
 #define DB_ESPNOW_AES_IV_LEN       12   // 96 bit
 #define DB_ESPNOW_AES_TAG_LEN      16
 #define DB_ESPNOW_AES_KEY_LEN      256  // in bits 128 & 192 are supported by ESP32

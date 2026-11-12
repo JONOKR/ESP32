@@ -26,6 +26,7 @@
 #include <freertos/timers.h>
 #include <string.h>
 #include <esp_crc.h>
+#include <esp_timer.h>
 #include <mbedtls/gcm.h>
 #include <mbedtls/md.h>
 #include <mbedtls/pkcs5.h>
@@ -646,8 +647,16 @@ void db_espnow_process_rcv_data(uint8_t *data, uint16_t data_len, uint8_t *src_a
             memcpy(db_uart_evt.source_mac, src_addr, ESP_NOW_ETH_ALEN);
             db_uart_evt.seq_num = db_esp_now_packet->db_esp_now_packet_header.seq_num;
             db_uart_evt.origin = origin;
-            if (xQueueSend(db_uart_write_queue, &db_uart_evt, ESPNOW_MAXDELAY) != pdTRUE) {
-                ESP_LOGW(TAG, "Send to db_uart_write_queue failed");
+            /* Drops rather than blocks, for the mirror of the reason in
+             * db_send_to_all_espnow: this task is the only one draining
+             * db_espnow_send_queue, and db_uart_write_queue is drained only by the
+             * control task. With 512 ms budgets on both, each task could sit waiting
+             * to hand work to the other - a circular wait that resolves only by
+             * timeout and loss. See memory.md 5.4. */
+            if (xQueueSend(db_uart_write_queue, &db_uart_evt,
+                           pdMS_TO_TICKS(DB_ESPNOW_DATA_QUEUE_DELAY_MS)) != pdTRUE) {
+                ESP_LOGW(TAG, "db_uart_write_queue full - dropping %u B downlink",
+                         db_uart_evt.data_len);
                 free(db_uart_evt.data);
             } else {
                 // all good
@@ -960,6 +969,10 @@ _Noreturn void process_espnow_data() {
     bool ready_to_send = true; // initially true
     bool send_internal_telemetry_frame = false;    // flag that indicates a new internal telemetry frame shall be sent
     int delay_timer_cnt = 0;
+    /* Starts in the past so the first peer-list frame goes out immediately rather than
+     * after a period of silence - the AIR's RADIO_STATUS has nothing to report until it
+     * arrives. */
+    int64_t last_internal_telemetry_us = -(int64_t) DB_ESPNOW_INTERNAL_TELEMETRY_PERIOD_US;
     while(1) {
         if (db_espnow_send_recv_callback_queue == NULL) ESP_LOGE(TAG, "db_espnow_send_recv_callback_queue is NULL!");
         if(db_espnow_send_recv_callback_queue != NULL && xQueueReceive(db_espnow_send_recv_callback_queue, &evt, 0) == pdTRUE) {
@@ -969,7 +982,15 @@ _Noreturn void process_espnow_data() {
                     // indicate that we can send next packet - the last sending callback has returned, so we keep the order
                     // of packets. ESP-NOW by default does not guarantee the order when many packets are sent in quick succession
                     ready_to_send = true;
-                    if (DB_PARAM_RADIO_MODE == DB_WIFI_MODE_ESPNOW_GND && send_internal_telemetry_frame) {
+                    /* Housekeeping only takes a queue slot while there are slots to
+                     * spare. The peer-list frame shares db_espnow_send_queue with the
+                     * GCS's uplink in FIFO order, so it cannot jump ahead of user data -
+                     * but at 211 B it can crowd the queue out by sheer volume, and a full
+                     * queue is what stalls the control task. Under pressure, drain user
+                     * data instead and let the RSSI display arrive late. */
+                    if (DB_PARAM_RADIO_MODE == DB_WIFI_MODE_ESPNOW_GND && send_internal_telemetry_frame &&
+                        db_espnow_send_queue != NULL &&
+                        uxQueueSpacesAvailable(db_espnow_send_queue) > (ESPNOW_QUEUE_SIZE / 2)) {
                         send_internal_telemetry_frame = !db_espnow_schedule_internal_telemetry_packet();
                     } else {
                         // try to immediately send the next packet if available and set ready_to_send accordingly
@@ -1001,10 +1022,19 @@ _Noreturn void process_espnow_data() {
             /* all actions are non-blocking so allow some delay so that the IDLE task of FreeRTOS and the watchdog can run
             read: https://esp32developer.com/programming-in-c-c/tasks/tasks-vs-co-routines for reference */
             vTaskDelay(10 / portTICK_PERIOD_MS);
-            send_internal_telemetry_frame = true;   // use this timer trigger to schedule a new internal telemetry frame
             delay_timer_cnt = 0;
         } else {
             delay_timer_cnt++;
+        }
+        /* The peer-list frame is scheduled on a wall clock, NOT on the loop counter
+         * above. Tying it to iteration count put it on air at roughly 66 Hz - the loop
+         * spins through 5000 trivial iterations in a few ms - which is ~113 kbps of
+         * 211 B housekeeping frames. Worse, the rate then varied with how busy the loop
+         * was, so the load rose exactly when the link could least afford it. */
+        const int64_t now_us = esp_timer_get_time();
+        if (now_us - last_internal_telemetry_us >= DB_ESPNOW_INTERNAL_TELEMETRY_PERIOD_US) {
+            last_internal_telemetry_us = now_us;
+            send_internal_telemetry_frame = true;
         }
     }
     vTaskDelete(NULL);
