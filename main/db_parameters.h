@@ -106,10 +106,19 @@ typedef bool (*db_param_output_callback_t)(const uint8_t *line, size_t line_leng
 #define DB_PARAM_ESPNOW_AIR2AIR db_param_espnow_air2air.value.db_param_u8.value
 
 /**
- * ESP-NOW addressing mode. 0 = broadcast everything (the behaviour this firmware
- * has always had), 1 = address control frames to a known peer and broadcast the
- * rest, 2 = address everything (diagnostic only - see
- * docs/decisions/2026-11-10-link-reliability-architecture.md).
+ * ESP-NOW addressing mode (docs/decisions/2026-11-10-link-reliability-architecture.md):
+ *  0 = broadcast everything - the behaviour this firmware has always had.
+ *  1 = control frames addressed, everything else broadcast. Implemented: a frame on
+ *      the decision doc's allowlist (db_espnow_frame_is_control(), per direction)
+ *      flushes the serial aggregation buffer and leaves alone, addressed to the MAC in
+ *      an ADDRESSED_DATA tunnel, else to the single known peer, else broadcast.
+ *      Telemetry, heartbeats, RADIO_STATUS, the GND's peer-list frame and the
+ *      link-stats report stay broadcast. Needs both ends on firmware that has it - see
+ *      db_espnow_seq_space.h for what an older peer does with it.
+ *  2 = everything addressed to the single known peer - a diagnostic for measuring
+ *      whether addressed frames pass at all, not for flying. Unchanged since it was
+ *      introduced so its measurements stay comparable.
+ * The routing table for all three is on db_espnow_resolve_destination_for_mode().
  *
  * 802.11 never acknowledges a group-addressed frame, so a broadcast ESP-NOW
  * packet is sent once and a lost one is gone. An addressed frame gets a MAC-layer
@@ -120,8 +129,8 @@ typedef bool (*db_param_output_callback_t)(const uint8_t *line, size_t line_leng
 
 enum {
     DB_ESPNOW_UNICAST_OFF = 0,      // broadcast everything
-    DB_ESPNOW_UNICAST_CONTROL = 1,  // control frames addressed, telemetry broadcast
-    DB_ESPNOW_UNICAST_ALL = 2,      // everything addressed - for measurement, not for flying
+    DB_ESPNOW_UNICAST_CONTROL = 1,  // control frames addressed, everything else broadcast (implemented)
+    DB_ESPNOW_UNICAST_ALL = 2,      // everything addressed - diagnostic only, not for flying
 };
 
 /**

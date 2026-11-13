@@ -458,7 +458,8 @@ db_parameter_t db_param_espnow_air2air = {
 };
 
 /**
- * ESP-NOW addressing mode: 0 broadcast everything, 1 control frames addressed, 2 all addressed.
+ * ESP-NOW addressing mode: 0 broadcast everything, 1 control frames addressed and everything else broadcast
+ * (implemented - the mode meant for flying once it is verified), 2 all addressed (diagnostic only).
  *
  * Defaults to 0, which is byte-for-byte the behaviour this firmware has always had.
  * See db_parameters.h for what the modes mean and why the default is off.

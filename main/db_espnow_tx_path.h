@@ -40,18 +40,31 @@
  * never go on air.
  */
 typedef enum {
-    /** Today's behaviour, and what every pre-existing caller gets: the role's single known
-     *  peer when ESPNOW_UNICAST asks for addressing (db_espnow_unicast_target()), else
-     *  broadcast. */
+    /** Unclassified traffic - every pre-existing caller, and everything that is not a control
+     *  frame. Mode 0: broadcast. Mode 1: broadcast (telemetry is never addressed, Trap 1).
+     *  Mode 2: the role's single known peer (db_espnow_unicast_target()), else broadcast -
+     *  unchanged from phase A. See db_espnow_resolve_destination_for_mode(). */
     DB_ESPNOW_DEST_AUTO = 0,
     /** Broadcast, whatever ESPNOW_UNICAST says. For measuring instruments that must not sit
      *  behind MAC retries (decision doc, Trap 9) - the link-stats report uses it. */
     DB_ESPNOW_DEST_BROADCAST = 1,
-    /** Addressed to the MAC carried in the event - used only if addressing is enabled
-     *  (ESPNOW_UNICAST != 0) and that MAC is a registered ESP-NOW peer; otherwise exactly
-     *  DB_ESPNOW_DEST_AUTO. Nothing sets this yet; phase B's per-message classification will. */
+    /** Addressed to the MAC carried in the event. Mode 1: that MAC if it is a registered
+     *  ESP-NOW peer, else broadcast (Trap 5 - a peer that could not be registered is reached by
+     *  broadcast, never by guessing another peer). Mode 0: broadcast. Set by the serial path
+     *  for a well-formed ADDRESSED_DATA tunnel. */
     DB_ESPNOW_DEST_PEER = 2,
+    /** A control frame with no explicit destination. Modes 1 and 2: the role's single known
+     *  peer, else broadcast. Mode 0: broadcast. */
+    DB_ESPNOW_DEST_CONTROL = 3,
 } db_espnow_dest_mode_t;
+
+/*
+ * ESPNOW_UNICAST values as this pure module sees them. Mirrors of DB_ESPNOW_UNICAST_* in
+ * db_parameters.h (which is not host-buildable); db_esp_now.c asserts they are equal.
+ */
+#define DB_ESPNOW_ADDRESSING_OFF      0U    // broadcast everything
+#define DB_ESPNOW_ADDRESSING_CONTROL  1U    // control frames addressed, everything else broadcast
+#define DB_ESPNOW_ADDRESSING_ALL      2U    // everything addressed via AUTO - diagnostic only
 
 /**
  * The address today's DB_ESPNOW_DEST_AUTO rule would pick, before the "is it a registered
@@ -90,6 +103,34 @@ const uint8_t *db_espnow_auto_target_candidate(bool unicast_enabled, bool is_air
 const uint8_t *db_espnow_resolve_destination(db_espnow_dest_mode_t mode, const uint8_t *dest_mac,
                                              bool dest_registered, bool unicast_enabled,
                                              const uint8_t *auto_target);
+
+/**
+ * Final destination of one packet under the ESPNOW_UNICAST mode - the one place the mode
+ * semantics live. db_esp_now.c routes every dequeued packet through this.
+ *
+ *  | request    | mode 0    | mode 1                          | mode 2 (= phase A)        |
+ *  |------------|-----------|---------------------------------|---------------------------|
+ *  | AUTO       | broadcast | broadcast                       | single peer, else bcast   |
+ *  | BROADCAST  | broadcast | broadcast                       | broadcast                 |
+ *  | CONTROL    | broadcast | single peer, else broadcast     | single peer, else bcast   |
+ *  | PEER(mac)  | broadcast | mac if registered, else bcast   | mac if registered, else   |
+ *  |            |           |                                 | single peer, else bcast   |
+ *
+ * Mode 2 is delegated to db_espnow_resolve_destination() unchanged, so every phase-A
+ * measurement taken in it stays comparable. Any other mode value broadcasts: an unknown
+ * setting must fail towards the behaviour the firmware has always had.
+ *
+ * @param unicast_mode ESPNOW_UNICAST (DB_ESPNOW_ADDRESSING_*)
+ * @param mode How the packet asked to be routed
+ * @param dest_mac MAC carried by the event (read only for DB_ESPNOW_DEST_PEER; may be NULL)
+ * @param dest_registered Whether dest_mac is currently a registered ESP-NOW peer
+ * @param single_peer The role's single known, registered peer (db_espnow_unicast_target()),
+ *                    or NULL when there is none
+ * @return The destination MAC, or NULL meaning broadcast
+ */
+const uint8_t *db_espnow_resolve_destination_for_mode(uint8_t unicast_mode, db_espnow_dest_mode_t mode,
+                                                      const uint8_t *dest_mac, bool dest_registered,
+                                                      const uint8_t *single_peer);
 
 /**
  * Single-flight state of the send path.

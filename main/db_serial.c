@@ -45,8 +45,18 @@
 #define FASTMAVLINK_ROUTER_COMPONENTS_MAX  5
 
 #include "db_mavlink_msgs.h"
+#include "db_espnow_frame_class.h"
 
 #define TAG "DB_SERIAL"
+
+/* The pure classifier carries its own copies of these (it cannot include fastmavlink); keep
+ * them in step with the ones the rest of the firmware uses. */
+_Static_assert(DB_ESPNOW_CLASS_TUNNEL_FLEET_LIST == DB_ESPNOW_TUNNEL_FLEET_LIST, "FLEET_LIST mismatch");
+_Static_assert(DB_ESPNOW_CLASS_TUNNEL_ADDRESSED_DATA == DB_ESPNOW_TUNNEL_ADDRESSED_DATA, "ADDRESSED_DATA mismatch");
+_Static_assert(DB_ESPNOW_CLASS_TUNNEL_LINK_STATS == DB_ESPNOW_TUNNEL_LINK_STATS, "LINK_STATS mismatch");
+_Static_assert(DB_MAVLINK_MSG_ID_TUNNEL == FASTMAVLINK_MSG_ID_TUNNEL, "TUNNEL id mismatch");
+_Static_assert(DB_MAVLINK_MSG_ID_COMMAND_LONG == FASTMAVLINK_MSG_ID_COMMAND_LONG, "COMMAND_LONG id mismatch");
+_Static_assert(DB_MAVLINK_MSG_ID_COMMAND_ACK == FASTMAVLINK_MSG_ID_COMMAND_ACK, "COMMAND_ACK id mismatch");
 
 uint8_t DB_MAV_SYS_ID = 1;
 uint32_t serial_total_byte_count = 0;
@@ -362,11 +372,54 @@ void db_parse_mavlink_from_radio(int *tcp_clients, udp_conn_list_t *udp_conns, u
 }
 
 /**
+ * Decide whether one complete MAVLink frame read from the serial port must leave on its own, and
+ * where to (decision doc 2026-11-10, Steps 4 and 5).
+ *
+ * Only ESPNOW_UNICAST mode 1 on an ESP-NOW role ever says yes; in every other configuration this
+ * returns false before decoding anything, so modes 0 and 2 and every WiFi/BLE mode run the
+ * aggregation path exactly as before. The serial port of a GND carries the GCS (frames travel
+ * GND->AIR) and that of an AIR the flight controller (AIR->GND), which picks the allowlist. The
+ * GPS beacon never comes through here - it has its own UBX path and emits only telemetry - so it
+ * stays broadcast. A frame whose CRC did not check (or whose id fastmavlink does not know) is
+ * never a control frame.
+ *
+ * @param result Parser result of the frame just completed (not modified; non-const only because fastmavlink's
+ *               fmav_frame_buf_to_msg() is declared that way)
+ * @param frame_buf The frame's bytes (the parser's frame buffer; not modified)
+ * @param route Receives the routing decision when the function returns true
+ * @return true if the frame must flush the accumulation buffer and travel alone
+ */
+static bool db_serial_espnow_route_frame(fmav_result_t *result, uint8_t *frame_buf,
+                                         db_espnow_frame_route_t *route) {
+    if (DB_PARAM_ESPNOW_UNICAST != DB_ESPNOW_UNICAST_CONTROL) {
+        return false;
+    }
+    if (DB_PARAM_RADIO_MODE != DB_WIFI_MODE_ESPNOW_GND && DB_PARAM_RADIO_MODE != DB_WIFI_MODE_ESPNOW_AIR) {
+        return false;
+    }
+    if (result->res != FASTMAVLINK_PARSE_RESULT_OK) {
+        return false;
+    }
+    /* Decoded here for the TUNNEL payload type and destination MAC. fmav_frame_buf_to_msg()
+     * zero-fills msg.payload past msg.len, but the classifier reads only msg.len bytes anyway. */
+    fmav_frame_buf_to_msg(&msg, result, frame_buf);
+    const db_espnow_link_dir_t dir = DB_PARAM_RADIO_MODE == DB_WIFI_MODE_ESPNOW_GND ?
+                                     DB_ESPNOW_LINK_GND_TO_AIR : DB_ESPNOW_LINK_AIR_TO_GND;
+    *route = db_espnow_route_frame(DB_PARAM_ESPNOW_UNICAST, dir, result->msgid, msg.payload, msg.len,
+                                   result->frame_len, DB_ESPNOW_PAYLOAD_MAXSIZE);
+    return route->travel_alone;
+}
+
+/**
  * Parses MAVLink messages and sends them via the radio link.
  * This function reads data from the serial interface, parses it for complete MAVLink messages, and sends those messages in a buffer.
  * It ensures that only complete messages are sent and that the buffer does not exceed TRANS_BUFF_SIZE.
  * Checks for a serial read timeout. In case timeout is reached all data read from serial so far will be flushed to radio interface
  * The parsing is done semi-transparent as in: parser understands the MavLink frame format but performs no further checks
+ *
+ * In ESPNOW_UNICAST mode 1 a control frame (db_espnow_frame_is_control()) is the one exception to aggregation: it
+ * flushes the buffer and is queued on its own with its own destination - see db_serial_espnow_route_frame(). In every
+ * other mode this function behaves exactly as it did before classification existed.
  *
  * @param tcp_clients Array of connected TCP clients
  * @param up_conns Structure containing all UDP connection data including the sockets
@@ -438,8 +491,22 @@ void db_read_serial_parse_mavlink(int *tcp_clients, udp_conn_list_t *udp_conns, 
         if (fmav_parse_and_check_to_frame_buf(&result, mav_parser_rx_buf, &fmav_status_serial, uart_read_buf[i])) {
             ESP_LOGD(TAG, "Parser detected a full message (%lu total): result.frame_len %i", serial_total_decoded_mav_msgs,
                      result.frame_len);
-            // Check if the new message will fit in the buffer
-            if (result.frame_len > packet_size) {
+            db_espnow_frame_route_t route;
+            if (db_serial_espnow_route_frame(&result, mav_parser_rx_buf, &route)) {
+                /* ESPNOW_UNICAST mode 1, control frame. One ESP-NOW packet has one destination,
+                 * so a control frame cannot share a packet with telemetry (Trap 2): send what
+                 * has accumulated first - routed AUTO, i.e. broadcast in this mode - then this
+                 * frame alone. Both go through the same FIFO queue and the single-flight send
+                 * path, so the order on air is the order read from serial. No retry here and
+                 * no broadcast copy: a dropped or failed frame is counted and left to the
+                 * protocol above, exactly as for every other frame. */
+                if (*serial_buff_pos > 0) {
+                    db_send_to_all_clients(tcp_clients, udp_conns, serial_buffer, *serial_buff_pos);
+                    *serial_buff_pos = 0;
+                }
+                (void) db_send_to_espnow_addressed(mav_parser_rx_buf, result.frame_len, route.dest_mode,
+                                                   route.dest_mac);
+            } else if (result.frame_len > packet_size) {    // otherwise: check if the new message will fit in the buffer
                 if (*serial_buff_pos > 0) {
                     db_send_to_all_clients(tcp_clients, udp_conns, serial_buffer, *serial_buff_pos);
                     *serial_buff_pos = 0;

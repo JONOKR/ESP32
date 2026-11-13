@@ -95,6 +95,49 @@ const uint8_t *db_espnow_resolve_destination(const db_espnow_dest_mode_t mode, c
 /**
  * See db_espnow_tx_path.h.
  *
+ * @param unicast_mode ESPNOW_UNICAST
+ * @param mode Requested routing
+ * @param dest_mac Event's MAC
+ * @param dest_registered dest_mac is a registered peer
+ * @param single_peer The role's single known registered peer, or NULL
+ * @return Destination MAC or NULL for broadcast
+ */
+const uint8_t *db_espnow_resolve_destination_for_mode(const uint8_t unicast_mode, const db_espnow_dest_mode_t mode,
+                                                      const uint8_t *dest_mac, const bool dest_registered,
+                                                      const uint8_t *single_peer) {
+    switch (unicast_mode) {
+        case DB_ESPNOW_ADDRESSING_ALL:
+            /* Phase A's rule, untouched. CONTROL is not a value it knows, and its default branch
+             * routes unknown requests like AUTO - which is exactly "single peer, else broadcast". */
+            return db_espnow_resolve_destination(mode, dest_mac, dest_registered, true, single_peer);
+        case DB_ESPNOW_ADDRESSING_CONTROL:
+            switch (mode) {
+                case DB_ESPNOW_DEST_CONTROL:
+                    return single_peer;
+                case DB_ESPNOW_DEST_PEER:
+                    if (dest_mac != NULL && dest_registered && !db_espnow_mac_is_broadcast(dest_mac)) {
+                        return dest_mac;
+                    }
+                    /* No-peer fallback (allowed), not send-failure fallback (forbidden). Not the
+                     * single known peer: the frame names a different unit. */
+                    return NULL;
+                case DB_ESPNOW_DEST_AUTO:
+                case DB_ESPNOW_DEST_BROADCAST:
+                default:
+                    /* Telemetry, heartbeats, RADIO_STATUS, the peer-list frame, link stats:
+                     * one broadcast slot serves the fleet, and an instrument must not sit
+                     * behind retries (Traps 1 and 9). */
+                    return NULL;
+            }
+        case DB_ESPNOW_ADDRESSING_OFF:
+        default:
+            return NULL;
+    }
+}
+
+/**
+ * See db_espnow_tx_path.h.
+ *
  * @param tracker Tracker to initialise
  */
 void db_espnow_tx_tracker_init(db_espnow_tx_tracker_t *tracker) {

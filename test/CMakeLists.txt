@@ -31,3 +31,21 @@ target_include_directories(db_espnow_link_stats_test PRIVATE
 
 add_test(NAME db_espnow_link_stats_test
         COMMAND db_espnow_link_stats_test)
+
+# ESPNOW_UNICAST mode 1: control-frame allowlists, ADDRESSED_DATA destination extraction, the
+# per-frame and per-mode routing decisions, and the sequence-number spaces.
+add_executable(db_espnow_frame_class_test
+        db_espnow_frame_class_test.c
+        ../main/db_espnow_frame_class.c
+        ../main/db_espnow_seq_space.c
+        ../main/db_espnow_tx_path.c
+        ../main/db_espnow_link_stats.c)
+
+target_compile_features(db_espnow_frame_class_test PRIVATE c_std_11)
+target_compile_options(db_espnow_frame_class_test PRIVATE -Wall -Wextra)
+target_include_directories(db_espnow_frame_class_test PRIVATE
+        ../main
+        ../components/fmav_c_lib_v2)
+
+add_test(NAME db_espnow_frame_class_test
+        COMMAND db_espnow_frame_class_test)

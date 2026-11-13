@@ -255,9 +255,11 @@ bool db_send_to_espnow_addressed(const uint8_t data[], const uint16_t data_lengt
  * Adds a payload to be sent via ESP-NOW to the ESP-NOW queue (where the esp-now task will pick it up, encrypt, package
  * and finally send it over the air)
  *
- * Routed DB_ESPNOW_DEST_AUTO - the role's single known peer when ESPNOW_UNICAST asks for addressing, else broadcast -
- * which is exactly how every packet was routed before destinations existed. Signature and behaviour kept for the
- * existing callers; see db_send_to_espnow_addressed() for the drop rules.
+ * Routed DB_ESPNOW_DEST_AUTO, i.e. as unclassified traffic: broadcast in ESPNOW_UNICAST modes 0 and 1, the role's
+ * single known peer (else broadcast) in mode 2 - see db_espnow_resolve_destination_for_mode(). Mode 0 and mode 2 are
+ * therefore exactly how every packet was routed before destinations existed; in mode 1 only frames the serial path
+ * classifies as control frames are addressed, and they do not come through here. Signature kept for the existing
+ * callers; see db_send_to_espnow_addressed() for the drop rules.
  *
  * @param data Pointer to the payload buffer
  * @param data_length Length of the payload data. Must not be bigger than DB_ESPNOW_PAYLOAD_MAXSIZE - fails otherwise

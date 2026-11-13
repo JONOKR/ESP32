@@ -37,8 +37,21 @@
 #include "globals.h"
 #include "main.h"
 #include "espnow.h"
+#include "db_espnow_seq_space.h"
 
 #define TAG "DB_ESPNOW"
+
+/* The pure routing module names the ESPNOW_UNICAST modes itself (it cannot include
+ * db_parameters.h); these keep the two in step. */
+_Static_assert(DB_ESPNOW_UNICAST_OFF == DB_ESPNOW_ADDRESSING_OFF, "ESPNOW_UNICAST mode 0 mismatch");
+_Static_assert(DB_ESPNOW_UNICAST_CONTROL == DB_ESPNOW_ADDRESSING_CONTROL, "ESPNOW_UNICAST mode 1 mismatch");
+_Static_assert(DB_ESPNOW_UNICAST_ALL == DB_ESPNOW_ADDRESSING_ALL, "ESPNOW_UNICAST mode 2 mismatch");
+
+/* At most one "send failed" console line per this many ms. At the edge of range an addressed
+ * frame can fail several times a second, and on a 115200-baud console each line costs ~5 ms of
+ * UART time in the ESP-NOW task's own loop. Every failure is still counted in db_link_stats
+ * (addressed_failed / broadcast_failed); the log is only a pointer to look there. */
+#define DB_ESPNOW_SEND_FAIL_LOG_INTERVAL_MS 1000
 
 static const uint8_t BROADCAST_MAC[ESP_NOW_ETH_ALEN] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 /* Receive-callback events only (DB_ESPNOW_RECV_CB). Send callbacks have their own queue below
@@ -68,7 +81,13 @@ const db_esp_now_clients_list_t *db_espnow_peer_list(void) {
     return db_esp_now_clients_list;
 } // Local list of known ESP-NOW peers with the last RSSI value and noise floor and sequence number
 
-// packet that is filled with payload and sent. Updates the sequ. number with every send.
+/* Sequence counters stamped into outgoing headers. Before phase B the header's own seq_num field
+ * was the one counter; it is now set from here for every packet, per space - see
+ * db_espnow_seq_space.h for why the GND splits by destination and the AIR does not. Initialised
+ * in db_espnow_init(); owned by the ESP-NOW task. */
+static db_espnow_seq_tx_t db_espnow_seq_tx;
+
+// packet that is filled with payload and sent. Its seq_num is set from db_espnow_seq_tx per send.
 static db_esp_now_packet_t db_esp_now_packet_global = {
         .db_esp_now_packet_header.seq_num = 0,
         .db_esp_now_packet_header.packet_type = DB_ESP_NOW_PACKET_TYPE_DATA
@@ -266,24 +285,24 @@ bool db_espnow_encrypt_auth_send(db_esp_now_packet_t *db_esp_now_packet, const u
 }
 
 /**
- * Destination of one dequeued packet: the event's own MAC when it asked for one and that MAC
- * is a registered peer, otherwise exactly the pre-existing rule (db_espnow_unicast_target(),
- * then broadcast). The decision itself is db_espnow_resolve_destination(), which is
- * host-tested; this only gathers the facts that need ESP-NOW.
+ * Destination of one dequeued packet under the current ESPNOW_UNICAST mode. The decision itself
+ * is db_espnow_resolve_destination_for_mode(), the single host-tested place the mode semantics
+ * live (its header carries the full table); this only gathers the facts that need ESP-NOW.
+ *
+ * Mode 0 and BROADCAST requests return before touching the peer table, as before.
  *
  * @param evt Dequeued send-queue element
  * @return Destination MAC, or NULL to broadcast
  */
 static const uint8_t *db_espnow_event_destination(const db_espnow_queue_event_t *evt) {
-    const bool unicast_enabled = DB_PARAM_ESPNOW_UNICAST != DB_ESPNOW_UNICAST_OFF;
+    const uint8_t unicast_mode = DB_PARAM_ESPNOW_UNICAST;
     const db_espnow_dest_mode_t mode = (db_espnow_dest_mode_t) evt->dest_mode;
-    if (mode == DB_ESPNOW_DEST_BROADCAST) {
+    if (unicast_mode == DB_ESPNOW_UNICAST_OFF || mode == DB_ESPNOW_DEST_BROADCAST) {
         return NULL;
     }
-    const bool dest_registered = mode == DB_ESPNOW_DEST_PEER && unicast_enabled &&
-                                 esp_now_is_peer_exist(evt->dest_mac);
-    return db_espnow_resolve_destination(mode, evt->dest_mac, dest_registered, unicast_enabled,
-                                         db_espnow_unicast_target());
+    const bool dest_registered = mode == DB_ESPNOW_DEST_PEER && esp_now_is_peer_exist(evt->dest_mac);
+    return db_espnow_resolve_destination_for_mode(unicast_mode, mode, evt->dest_mac, dest_registered,
+                                                  db_espnow_unicast_target());
 }
 
 /**
@@ -322,14 +341,14 @@ bool db_read_uart_queue_and_send() {
         memcpy(db_esp_now_packet_global.db_esp_now_packet_protected_data.payload, evt.data, evt.data_len);
         free(evt.data);
         const uint8_t *dest = db_espnow_event_destination(&evt);
+        /* The sequence number comes from the destination's space and must be in the header
+         * before encryption: the header is the AES-GCM associated data. */
+        uint32_t *seq_counter = db_espnow_seq_tx_counter(&db_espnow_seq_tx, dest);
+        db_esp_now_packet_global.db_esp_now_packet_header.seq_num = *seq_counter;
         // Encrypt, authenticate and send packet
         if(db_espnow_encrypt_auth_send(&db_esp_now_packet_global, evt.data_len, dest)) {
-            // update sequence number for next packet
-            if (db_esp_now_packet_global.db_esp_now_packet_header.seq_num < UINT32_MAX) {
-                db_esp_now_packet_global.db_esp_now_packet_header.seq_num++;    // packet is static so just increase number once we sent it
-            } else {
-                db_esp_now_packet_global.db_esp_now_packet_header.seq_num = 0;  // catch overflow in case someone got crazy
-            }
+            // advance this space's sequence number for its next packet (wraps to 0 after UINT32_MAX)
+            *seq_counter = db_espnow_seq_next(*seq_counter);
             /* Counted here, beside the sequence-number increment, and nowhere else: that is
              * what makes sent_broadcast + sent_addressed the exact population the peer's
              * sequence-gap loss counter observes. */
@@ -467,8 +486,11 @@ static void db_espnow_sync_rate_config(void) {
  * (802.11b) while this firmware sets the interface to
  * WIFI_PROTOCOL_11B | WIFI_PROTOCOL_LR, so a peer registered without a rate config can
  * transmit on a different PHY mode than the link was set up for.
- * esp_now_set_peer_rate_config() must be called *after* esp_now_add_peer(), and is
- * pinned here to LR at 250 kbps - the mode this link exists for.
+ * esp_now_set_peer_rate_config() must be called *after* esp_now_add_peer(), so it is
+ * applied here, right after registration, as whatever DB_PARAM_ESPNOW_RATE asks for
+ * (db_espnow_apply_rate_config() - which leaves the driver's own choice untouched on
+ * DRIVER_DEFAULT). It is not pinned to any one rate: the rate is a separate parameter so
+ * that it and the addressing mode can never change together.
  *
  * Failure is never fatal: db_espnow_unicast_target() only offers a peer that is actually
  * registered, so anything that fails here falls back to broadcast.
@@ -553,30 +575,28 @@ static const uint8_t *db_espnow_unicast_target(void) {
  * come from a different sender and would corrupt the arithmetic; the caller guarantees
  * origin == DB_ESPNOW_ORIGIN_GND.
  *
+ * **Two spaces.** A GND that addresses control frames to individual AIR units numbers its
+ * broadcasts and its packets for each AIR separately (db_espnow_seq_space.h), so that a frame
+ * it addressed to a *different* AIR - which this unit never receives - is not a gap here. The
+ * frame's 802.11 destination tells the spaces apart; both feed the one reported total. In mode 0
+ * nothing is addressed and only the broadcast space ever moves, i.e. this counts exactly as it
+ * did before spaces existed. The rule per space (adopt the first packet, add forward gaps,
+ * saturate, clear on a backward step) is db_espnow_seq_rx_update(), unchanged in substance.
+ *
  * @param seq_num Sequence number from the header of the packet just received from the GND
+ * @param addressed true if the packet was addressed to this unit, false if it was broadcast
  */
-static void db_espnow_count_uplink_loss(const uint32_t seq_num) {
-    if (!db_esp_signal_quality.air_seq_initialised) {
-        /* First packet from this GND. Adopt its position in the sequence instead of
-         * treating everything the GND sent before we were listening as lost - an AIR unit
-         * powered up beside a running GND would otherwise report tens of thousands of
-         * lost packets and discredit the counter on sight. */
-        db_esp_signal_quality.air_seq_initialised = 1;
-    } else if (seq_num > db_esp_signal_quality.air_last_seq_num) {
-        const uint32_t lost = (uint32_t) db_esp_signal_quality.air_rx_packets_lost +
-                              (seq_num - db_esp_signal_quality.air_last_seq_num - 1);
-        /* Saturate rather than wrap: the GCS reads this as a delta, and a counter pinned
-         * at the top still reads as "losing everything" where a wrapped one would look
-         * briefly healthy. */
-        db_esp_signal_quality.air_rx_packets_lost = (lost > UINT16_MAX) ? UINT16_MAX : (uint16_t) lost;
-    } else {
+static void db_espnow_count_uplink_loss(const uint32_t seq_num, const bool addressed) {
+    db_espnow_seq_rx_t *space = addressed ? &db_esp_signal_quality.air_seq_rx_addressed
+                                          : &db_esp_signal_quality.air_seq_rx_broadcast;
+    if (db_espnow_seq_rx_update(space, seq_num, &db_esp_signal_quality.air_rx_packets_lost) ==
+        DB_ESPNOW_SEQ_RX_BACKWARD) {
         /* Sequence went backwards: the GND rebooted and restarted at 0, or this is a
          * replayed frame. Same choice the GND makes for its own direction - resynchronise
          * and keep the link usable rather than discard a packet that decrypted correctly. */
-        ESP_LOGW(TAG, "Uplink sequence number lower than expected. GND did reset or packet may be part of a replay attack.");
-        db_esp_signal_quality.air_rx_packets_lost = 0;
+        ESP_LOGW(TAG, "Uplink sequence number lower than expected (%s space). GND did reset or packet may be part of a replay attack.",
+                 addressed ? "addressed" : "broadcast");
     }
-    db_esp_signal_quality.air_last_seq_num = seq_num;
 }
 
 /**
@@ -624,8 +644,11 @@ int16_t update_peer_list(db_esp_now_clients_list_t *esp_now_clients, uint8_t bro
  * @param src_addr Source MAC address of the data
  * @param rssi RSSI in dBm of this packet
  * @param noise_floor Noise floor in dBm measured while receiving this packet
+ * @param addressed true if the frame was addressed to this unit, false if it was broadcast. Selects the sequence
+ *                  space the AIR's uplink loss counter uses (db_espnow_count_uplink_loss()).
  */
-void db_espnow_process_rcv_data(uint8_t *data, uint16_t data_len, uint8_t *src_addr, int8_t rssi, int8_t noise_floor) {
+void db_espnow_process_rcv_data(uint8_t *data, uint16_t data_len, uint8_t *src_addr, int8_t rssi, int8_t noise_floor,
+                                bool addressed) {
     const uint16_t minimum_packet_length = db_esp_now_packet_header_len + DB_ESPNOW_AES_TAG_LEN + 1U;
     if (data == NULL || src_addr == NULL || data_len < minimum_packet_length) {
         ESP_LOGW(TAG, "Ignoring malformed ESP-NOW packet of length %u", data_len);
@@ -677,7 +700,7 @@ void db_espnow_process_rcv_data(uint8_t *data, uint16_t data_len, uint8_t *src_a
             // AIR link quality must describe the GND link, never a neighbouring AIR peer.
             db_esp_signal_quality.air_rssi = rssi;
             db_esp_signal_quality.air_noise_floor = noise_floor;
-            db_espnow_count_uplink_loss(db_esp_now_packet->db_esp_now_packet_header.seq_num);
+            db_espnow_count_uplink_loss(db_esp_now_packet->db_esp_now_packet_header.seq_num, addressed);
             /* Learn the ground station's address so replies can be addressed to it. The
              * AIR side learnt nothing before 2026-11-11, which is why the first unicast
              * attempt went one way only. Re-register whenever the MAC changes - a
@@ -813,8 +836,9 @@ static void db_espnow_receive_callback(const esp_now_recv_info_t *recv_info, con
      * Accepting them is safe - the payload is AES-GCM authenticated below, so a forged
      * frame gets no further whatever its destination address. See
      * docs/decisions/2026-11-10-link-reliability-architecture.md.
-     * des_addr is still read above; kept because per-destination accounting will want it. */
-    (void) des_addr;
+     * des_addr decides which sequence space the packet belongs to (db_espnow_seq_space.h):
+     * anything that is not the broadcast address reached us only because it was addressed to
+     * us - the radio filters out frames addressed to other units. */
 
     // The header is authenticated later. This early rejection only avoids allocating and queueing known-disallowed traffic.
     if (!db_espnow_origin_is_allowed(data[0])) {
@@ -831,6 +855,7 @@ static void db_espnow_receive_callback(const esp_now_recv_info_t *recv_info, con
     }
     memcpy(recv_cb->data, data, len);
     recv_cb->data_len = len;
+    recv_cb->addressed = !IS_BROADCAST_ADDR(des_addr);
     recv_cb->rssi = recv_info->rx_ctrl == NULL ? -127 : recv_info->rx_ctrl->rssi;
     recv_cb->noise_floor = 0;
 #if defined(CONFIG_IDF_TARGET_ESP32) || defined(CONFIG_IDF_TARGET_ESP32S3) || defined(CONFIG_IDF_TARGET_ESP32C3) || defined(CONFIG_IDF_TARGET_ESP32C2) || defined(CONFIG_IDF_TARGET_ESP32S2) || defined(CONFIG_IDF_TARGET_ESP32C6)
@@ -917,6 +942,9 @@ esp_err_t db_espnow_init() {
         return ESP_FAIL;
     }
     db_espnow_tx_tracker_init(&db_espnow_tx_tracker);
+    /* Only the GND addresses more than one destination, so only it needs a space per
+     * destination; see db_espnow_seq_space.h for why the AIR deliberately keeps one. */
+    db_espnow_seq_tx_init(&db_espnow_seq_tx, DB_PARAM_RADIO_MODE == DB_WIFI_MODE_ESPNOW_GND);
 
     /* Init Queues for communication with control task */
     db_espnow_send_queue = xQueueCreate(ESPNOW_QUEUE_SIZE, sizeof(db_espnow_queue_event_t));
@@ -985,7 +1013,8 @@ esp_err_t db_espnow_init() {
  * Runs in the ESP-NOW task, which is the only task that drains db_espnow_send_queue - so it must never wait for a
  * slot there (it would be waiting for itself). Zero timeout; the caller's free-slot gate makes a full queue
  * practically impossible, and a refusal just leaves the frame pending for the next send callback.
- * Routed DB_ESPNOW_DEST_AUTO, i.e. exactly as before this field existed.
+ * Routed DB_ESPNOW_DEST_AUTO: broadcast in ESPNOW_UNICAST modes 0 and 1 (in mode 1 it is housekeeping, not a control
+ * frame, and every AIR reads it), the single known peer in mode 2 as before.
  *
  * @return true when packet was scheduled for sending, false if it will not be sent
  */
@@ -1029,6 +1058,33 @@ bool db_espnow_schedule_internal_telemetry_packet() {
 }
 
 /**
+ * Log a failed send, at most once per DB_ESPNOW_SEND_FAIL_LOG_INTERVAL_MS.
+ *
+ * Failures are already counted in db_link_stats by db_espnow_tx_on_send_cb(); this line only
+ * tells someone at the console to look there. Unthrottled it was one line per failure, which at
+ * the edge of range with addressed frames is several lines a second on a 115200-baud console,
+ * written from the ESP-NOW task's own loop. The line carries how many failures it stands for.
+ * Called only from the ESP-NOW task, so the statics need no locking.
+ *
+ * @param mac Destination MAC of the failed send, as reported by the send callback
+ */
+static void db_espnow_log_send_failure(const uint8_t mac[ESP_NOW_ETH_ALEN]) {
+    static bool logged_once = false;
+    static int64_t last_log_us = 0;
+    static uint32_t suppressed = 0;
+    const int64_t now_us = esp_timer_get_time();
+    if (logged_once && now_us - last_log_us < (int64_t) DB_ESPNOW_SEND_FAIL_LOG_INTERVAL_MS * 1000) {
+        suppressed++;
+        return;
+    }
+    ESP_LOGW(TAG, "ESP-NOW send failed - MAC: " MACSTR " (+%lu suppressed since last line; all counted in link stats)",
+             MAC2STR(mac), (unsigned long) suppressed);
+    suppressed = 0;
+    last_log_us = now_us;
+    logged_once = true;
+}
+
+/**
  *  Task that handles all ESP-NOW related data processing. Reads ESP-NOW Callback-Queue, Reads ESP-NOW send queue and
  *  writes to UART-WRITE Queue.
  */
@@ -1055,7 +1111,7 @@ _Noreturn void process_espnow_data() {
         if (db_espnow_send_cb_queue != NULL && xQueueReceive(db_espnow_send_cb_queue, &send_cb_evt, 0) == pdTRUE) {
             const bool success = send_cb_evt.status == ESP_NOW_SEND_SUCCESS;
             if (!success) {
-                ESP_LOGW(TAG, "ESP-NOW send failed - MAC: " MACSTR, MAC2STR(send_cb_evt.mac_addr));
+                db_espnow_log_send_failure(send_cb_evt.mac_addr);
             }
             // the last sending callback has returned, so we keep the order of packets. ESP-NOW by default does not
             // guarantee the order when many packets are sent in quick succession. A late callback (its packet was
@@ -1090,7 +1146,7 @@ _Noreturn void process_espnow_data() {
                 case DB_ESPNOW_RECV_CB: {
                     db_espnow_event_recv_cb_t *recv_cb = &evt.info.recv_cb;
                     db_espnow_process_rcv_data(recv_cb->data, recv_cb->data_len, recv_cb->mac_addr, recv_cb->rssi,
-                                                recv_cb->noise_floor);
+                                                recv_cb->noise_floor, recv_cb->addressed);
                     free(recv_cb->data);
                     break;
                 }

@@ -142,6 +142,7 @@ typedef struct {
     int8_t noise_floor;
     uint8_t data_len;
     uint8_t *data;
+    bool addressed;     // 802.11 destination was this unit, not broadcast - selects the sequence space
 } db_espnow_event_recv_cb_t;
 
 typedef union {
