@@ -24,6 +24,7 @@
 #include "globals.h"
 #include <esp_wifi.h>
 #include "db_led_indicator.h"
+#include "db_esp32_control.h"
 
 #define TAG "DB_TIMERS"
 
@@ -235,6 +236,64 @@ void db_timer_start_mavlink_fleet_list() {
     if (xFleetListTimerHandle != NULL) {
         ESP_LOGI(TAG, "Starting to send fleet list packets.");
         xTimerStart(xFleetListTimerHandle, 0);
+    }
+}
+
+/**
+ * Timer callback that emits this unit's link-stats TUNNEL (format: db_espnow_link_stats.h).
+ *
+ * GND: written to its serial link, i.e. straight to the GCS - same path and same fmav status as the fleet list.
+ * AIR / beacon: queued for ESP-NOW with DB_ESPNOW_DEST_BROADCAST, so it stays broadcast in every ESPNOW_UNICAST mode.
+ * This report and RADIO_STATUS are the instruments the unicast work is judged by; behind MAC retries they would
+ * measure post-retry quality instead of the link (decision doc, Trap 9). The GND forwards it to the GCS.
+ * It travels as an ordinary DATA packet, so it takes part in the ESP-NOW sequence numbering like any other data and
+ * an old GND passes it through unchanged (see db_parse_mavlink_from_radio).
+ *
+ * No-op outside the ESP-NOW roles, and unless the serial protocol is MAVLink or the GPS beacon (the same gate as
+ * RADIO_STATUS): in transparent/MSP/LTM mode a MAVLink frame on the radio would be injected into a non-MAVLink stream.
+ *
+ * @param pxTimer
+ */
+void db_timer_link_stats_callback(TimerHandle_t pxTimer) {
+    if (DB_PARAM_SERIAL_PROTO != DB_SERIAL_PROTOCOL_MAVLINK &&
+        DB_PARAM_SERIAL_PROTO != DB_SERIAL_PROTOCOL_UBX_BEACON) {
+        return;
+    }
+    static uint8_t buff[296];
+    if (DB_PARAM_RADIO_MODE == DB_WIFI_MODE_ESPNOW_GND) {
+        uint16_t len = db_mav_create_link_stats(buff, &fmav_status_serial);
+        if (len > 0) {
+            write_to_serial(buff, len);
+        }
+    } else if (DB_PARAM_RADIO_MODE == DB_WIFI_MODE_ESPNOW_AIR) {
+        uint16_t len = db_mav_create_link_stats(buff, &fmav_status_radio);
+        if (len > 0) {
+            (void) db_send_to_espnow_addressed(buff, len, DB_ESPNOW_DEST_BROADCAST, NULL);
+        }
+    } else {
+        // not an ESP-NOW role - nothing to report
+    }
+}
+
+/**
+ * Starts the periodic link-stats emitter. Safe to start in any role - the callback self-gates.
+ */
+void db_timer_start_link_stats() {
+    static TimerHandle_t xLinkStatsTimerHandle;
+    xLinkStatsTimerHandle = xTimerCreate(
+            "Link_Stats_Timer",
+            pdMS_TO_TICKS(DB_TIMER_LINK_STATS_MS),
+            pdTRUE,
+            (void *) 0,
+            db_timer_link_stats_callback
+    );
+
+    if (xLinkStatsTimerHandle == NULL) {
+        ESP_LOGE(TAG, "Failed to create link stats timer.");
+    }
+    if (xLinkStatsTimerHandle != NULL) {
+        ESP_LOGI(TAG, "Starting to send link stats packets.");
+        xTimerStart(xLinkStatsTimerHandle, 0);
     }
 }
 

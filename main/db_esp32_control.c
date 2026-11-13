@@ -199,30 +199,71 @@ void db_send_to_all_udp_clients(const uint8_t *data, uint data_length) {
 }
 
 /**
- * Adds a payload to be sent via ESP-NOW to the ESP-NOW queue (where the esp-now task will pick it up, encrypt, package
- * and finally send it over the air)
+ * Adds one payload to the ESP-NOW send queue with an explicit routing request (where the esp-now task will pick it
+ * up, encrypt, package, resolve the destination and finally send it over the air).
+ *
+ * The addressed counterpart of db_send_to_all_espnow(). How dest_mode is honoured is documented on
+ * db_espnow_dest_mode_t: DB_ESPNOW_DEST_PEER uses dest_mac only when addressing is enabled and the MAC is a
+ * registered peer, and otherwise routes exactly like DB_ESPNOW_DEST_AUTO, i.e. like every caller before this existed.
  *
  * Drops the payload rather than waiting for a slot: this runs inside
  * read_process_serial_link(), on the one task that also drains db_uart_write_queue
  * further down its loop, so blocking here stops the unit serving its serial link at
  * all. See DB_ESPNOW_DATA_QUEUE_DELAY_MS for the measurement that forced this.
+ * Every drop is counted in db_link_stats so it reaches the ground station.
+ *
+ * @param data Pointer to the payload buffer
+ * @param data_length Length of the payload, 1..DB_ESPNOW_PAYLOAD_MAXSIZE. Callers split larger data first.
+ * @param dest_mode How the ESP-NOW task picks the destination
+ * @param dest_mac Destination for DB_ESPNOW_DEST_PEER (6 bytes); ignored otherwise and may be NULL
+ * @return true if the payload was queued, false if it was dropped
+ */
+bool db_send_to_espnow_addressed(const uint8_t data[], const uint16_t data_length,
+                                 const db_espnow_dest_mode_t dest_mode, const uint8_t dest_mac[ESP_NOW_ETH_ALEN]) {
+    if (data == NULL || data_length == 0 || data_length > DB_ESPNOW_PAYLOAD_MAXSIZE || db_espnow_send_queue == NULL) {
+        /* data_len is a uint8_t and the packet buffer is DB_ESPNOW_PAYLOAD_MAXSIZE long: an oversized payload would be
+         * truncated or overflow it, so refuse it here at the source. */
+        ESP_LOGE(TAG, "Refusing ESP-NOW payload of %u B", data_length);
+        db_link_stats_inc(&db_link_stats.send_error);
+        return false;
+    }
+    db_espnow_queue_event_t evt = {0};
+    evt.data = malloc(data_length);
+    if (evt.data == NULL) {
+        db_link_stats_inc(&db_link_stats.drop_alloc_fail);
+        ESP_LOGE(TAG, "malloc(%u) failed - dropping uplink payload", data_length);
+        return false;
+    }
+    memcpy(evt.data, data, data_length);
+    evt.data_len = (uint8_t) data_length;
+    evt.packet_type = DB_ESP_NOW_PACKET_TYPE_DATA;
+    evt.dest_mode = (uint8_t) dest_mode;
+    if (dest_mode == DB_ESPNOW_DEST_PEER && dest_mac != NULL) {
+        memcpy(evt.dest_mac, dest_mac, ESP_NOW_ETH_ALEN);
+    }
+    if (xQueueSend(db_espnow_send_queue, &evt,
+                   pdMS_TO_TICKS(DB_ESPNOW_DATA_QUEUE_DELAY_MS)) != pdTRUE) {
+        ESP_LOGW(TAG, "db_espnow_send_queue full - dropping %u B uplink", data_length);
+        db_link_stats_inc(&db_link_stats.drop_send_queue_full);
+        free(evt.data);
+        return false;
+    }
+    return true;
+}
+
+/**
+ * Adds a payload to be sent via ESP-NOW to the ESP-NOW queue (where the esp-now task will pick it up, encrypt, package
+ * and finally send it over the air)
+ *
+ * Routed DB_ESPNOW_DEST_AUTO - the role's single known peer when ESPNOW_UNICAST asks for addressing, else broadcast -
+ * which is exactly how every packet was routed before destinations existed. Signature and behaviour kept for the
+ * existing callers; see db_send_to_espnow_addressed() for the drop rules.
  *
  * @param data Pointer to the payload buffer
  * @param data_length Length of the payload data. Must not be bigger than DB_ESPNOW_PAYLOAD_MAXSIZE - fails otherwise
  */
 void db_send_to_all_espnow(uint8_t data[], const uint16_t *data_length) {
-    db_espnow_queue_event_t evt;
-    evt.data = malloc(*data_length);
-    memcpy(evt.data, data, *data_length);
-    evt.data_len = *data_length;
-    evt.packet_type = DB_ESP_NOW_PACKET_TYPE_DATA;
-    if (xQueueSend(db_espnow_send_queue, &evt,
-                   pdMS_TO_TICKS(DB_ESPNOW_DATA_QUEUE_DELAY_MS)) != pdTRUE) {
-        ESP_LOGW(TAG, "db_espnow_send_queue full - dropping %u B uplink", *data_length);
-        free(evt.data);
-    } else {
-        // all good
-    }
+    (void) db_send_to_espnow_addressed(data, *data_length, DB_ESPNOW_DEST_AUTO, NULL);
 }
 
 /**
@@ -266,6 +307,10 @@ void db_send_to_all_clients(int tcp_clients[], udp_conn_list_t *n_udp_conn_list,
         case DB_BLUETOOTH_MODE:
 #ifdef CONFIG_BT_ENABLED
             bleData.data = malloc(data_length);
+            if (bleData.data == NULL) {
+                ESP_LOGE(TAG, "malloc(%u) failed - dropping BLE payload", data_length);
+                break;      // drop rather than memcpy into NULL
+            }
             bleData.data_len = data_length;
             memcpy(bleData.data, data, bleData.data_len);
             if (xQueueSend(db_uart_read_queue_ble, &bleData, portMAX_DELAY) != pdPASS) {
@@ -317,6 +362,10 @@ void db_send_to_all_radio_clients(uint8_t data[], uint16_t data_length) {
         case DB_BLUETOOTH_MODE:
 #ifdef CONFIG_BT_ENABLED
             bleData.data = malloc(data_length);
+            if (bleData.data == NULL) {
+                ESP_LOGE(TAG, "malloc(%u) failed - dropping BLE payload", data_length);
+                break;      // drop rather than memcpy into NULL
+            }
             bleData.data_len = data_length;
             memcpy(bleData.data, data, bleData.data_len);
             if (xQueueSend(db_uart_read_queue_ble, &bleData, portMAX_DELAY) != pdPASS) {

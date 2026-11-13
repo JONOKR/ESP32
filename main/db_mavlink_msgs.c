@@ -23,7 +23,9 @@
 #include "db_parameters.h"
 #include "db_serial.h"
 #include "db_esp_now.h"
+#include "db_espnow_link_stats.h"
 #include "globals.h"
+#include <esp_timer.h>
 #include "main.h"
 
 #ifndef MIN
@@ -122,6 +124,49 @@ uint16_t db_mav_create_fleet_list(uint8_t *buff, fmav_status_t *fmav_status) {
     }
     tunnel.payload_length = 1 + (count * ESP_NOW_ETH_ALEN);
 
+    return fmav_msg_tunnel_encode_to_frame_buf(buff, db_get_mav_sys_id(), db_get_mav_comp_id(), &tunnel,
+                                               fmav_status);
+}
+
+/**
+ * Builds a DroneBridge "link stats" message: a MAVLink TUNNEL (payload_type DB_ESPNOW_TUNNEL_LINK_STATS) carrying
+ * this unit's ESP-NOW counters since boot (db_link_stats) in the version-1 format documented in
+ * db_espnow_link_stats.h.
+ *
+ * The unit identifies itself by its own MAC inside the payload, not by the MAVLink sysid, because several AIR units
+ * share sysid 1 until the fleet numbering has run, and the GND's sysid is whatever the GCS uses.
+ *
+ * @param buff Output frame buffer (>=296 bytes)
+ * @param fmav_status fastmavlink status struct used for the sequence number - the same one the unit's other
+ *                    self-generated frames on that link use, so the GCS sees one continuous MAVLink sequence
+ * @return length of the encoded frame in buff, or 0 if the report could not be built
+ */
+uint16_t db_mav_create_link_stats(uint8_t *buff, fmav_status_t *fmav_status) {
+    db_link_stats_report_t report;
+    memset(&report, 0, sizeof(report));
+    if (DB_PARAM_RADIO_MODE == DB_WIFI_MODE_ESPNOW_GND) {
+        report.role = DB_LINK_STATS_ROLE_GND;
+    } else if (DB_PARAM_SERIAL_PROTO == DB_SERIAL_PROTOCOL_UBX_BEACON) {
+        report.role = DB_LINK_STATS_ROLE_AIR_BEACON;
+    } else {
+        report.role = DB_LINK_STATS_ROLE_AIR;
+    }
+    memcpy(report.mac, LOCAL_MAC_ADDRESS, DB_ESPNOW_MAC_ADDR_LEN);
+    report.espnow_unicast = DB_PARAM_ESPNOW_UNICAST;
+    report.espnow_rate = DB_PARAM_ESPNOW_RATE;
+    report.uptime_ms = (uint32_t) (esp_timer_get_time() / 1000);
+    db_link_stats_snapshot(&db_link_stats, &report.counters);
+
+    fmav_tunnel_t tunnel;
+    memset(&tunnel, 0, sizeof(tunnel));
+    tunnel.payload_type = DB_ESPNOW_TUNNEL_LINK_STATS;
+    tunnel.target_system = 0;       // broadcast - the GCS picks it up by payload_type
+    tunnel.target_component = 0;
+    const size_t len = db_link_stats_pack(&report, tunnel.payload, sizeof(tunnel.payload));
+    if (len == 0) {
+        return 0;
+    }
+    tunnel.payload_length = (uint8_t) len;
     return fmav_msg_tunnel_encode_to_frame_buf(buff, db_get_mav_sys_id(), db_get_mav_comp_id(), &tunnel,
                                                fmav_status);
 }

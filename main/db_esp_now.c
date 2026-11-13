@@ -41,7 +41,14 @@
 #define TAG "DB_ESPNOW"
 
 static const uint8_t BROADCAST_MAC[ESP_NOW_ETH_ALEN] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-static QueueHandle_t db_espnow_send_recv_callback_queue;    // Queue that contains ESP-NOW callback results
+/* Receive-callback events only (DB_ESPNOW_RECV_CB). Send callbacks have their own queue below
+ * so that received traffic can never crowd out the event the send path depends on. */
+static QueueHandle_t db_espnow_send_recv_callback_queue;
+/* Send-callback results (db_espnow_event_send_cb_t), filled from the WiFi task with a zero
+ * timeout. See DB_ESPNOW_SEND_CB_QUEUE_SIZE. */
+static QueueHandle_t db_espnow_send_cb_queue;
+/* Single-flight state of the send path; owned by the ESP-NOW task, which is its only user. */
+static db_espnow_tx_tracker_t db_espnow_tx_tracker;
 QueueHandle_t db_espnow_send_queue;    // Queue that contains data to be sent via ESP-NOW (filled by control task)
 QueueHandle_t db_uart_write_queue;    // Queue that contains data to be written to UART (filled by ESP-NOW task)
 static db_esp_now_clients_list_t *db_esp_now_clients_list;
@@ -221,11 +228,18 @@ int db_decrypt_payload(db_esp_now_packet_t* db_esp_now_packet, uint8_t* decrypt_
 
 /**
  * Encrypts, authenticates and sends packet via ESP-NOW
+ *
+ * The destination is resolved by the caller (db_read_uart_queue_and_send) because it has to
+ * know afterwards whether the packet in flight was addressed or broadcast: that decides how
+ * its send callback is counted.
+ *
  * @param db_esp_now_packet Packet to send
  * @param payload_length Value of payload_length_decrypted of db_esp_now_packet - saves us from creating a var inside the function
+ * @param dest Destination MAC, or NULL to broadcast
  * @return false if no packet was sent, true if packet was sent (actual sending will be confirmed by the send-callback)
  */
-bool db_espnow_encrypt_auth_send(db_esp_now_packet_t *db_esp_now_packet, const uint8_t payload_length) {
+bool db_espnow_encrypt_auth_send(db_esp_now_packet_t *db_esp_now_packet, const uint8_t payload_length,
+                                 const uint8_t *dest) {
     static int ret;
     static esp_err_t err;
     // after encryption the payload_length_decrypted will be unreadable -> keep a copy (payload_length) for sending the packet
@@ -235,9 +249,6 @@ bool db_espnow_encrypt_auth_send(db_esp_now_packet_t *db_esp_now_packet, const u
         /* Pick up a changed ESPNOW_RATE before sending, so the parameter and the radio
          * cannot disagree (there is no reboot command to fall back on). */
         db_espnow_sync_rate_config();
-        /* Addressed to the peer when one is known and the mode asks for it, so the WiFi
-         * MAC acknowledges and retransmits it; broadcast otherwise. */
-        const uint8_t *dest = db_espnow_unicast_target();
         if (dest == NULL) {
             dest = BROADCAST_MAC;
         }
@@ -255,8 +266,35 @@ bool db_espnow_encrypt_auth_send(db_esp_now_packet_t *db_esp_now_packet, const u
 }
 
 /**
- * Tries to read one entry from the ESP-NOW send queue (mainly filled by the UART task) and sends the data via broadcast.
- * Only call this function when the last ESP-NOW send callback has returned! Otherwise order of packets is not guaranteed
+ * Destination of one dequeued packet: the event's own MAC when it asked for one and that MAC
+ * is a registered peer, otherwise exactly the pre-existing rule (db_espnow_unicast_target(),
+ * then broadcast). The decision itself is db_espnow_resolve_destination(), which is
+ * host-tested; this only gathers the facts that need ESP-NOW.
+ *
+ * @param evt Dequeued send-queue element
+ * @return Destination MAC, or NULL to broadcast
+ */
+static const uint8_t *db_espnow_event_destination(const db_espnow_queue_event_t *evt) {
+    const bool unicast_enabled = DB_PARAM_ESPNOW_UNICAST != DB_ESPNOW_UNICAST_OFF;
+    const db_espnow_dest_mode_t mode = (db_espnow_dest_mode_t) evt->dest_mode;
+    if (mode == DB_ESPNOW_DEST_BROADCAST) {
+        return NULL;
+    }
+    const bool dest_registered = mode == DB_ESPNOW_DEST_PEER && unicast_enabled &&
+                                 esp_now_is_peer_exist(evt->dest_mac);
+    return db_espnow_resolve_destination(mode, evt->dest_mac, dest_registered, unicast_enabled,
+                                         db_espnow_unicast_target());
+}
+
+/**
+ * Tries to read one entry from the ESP-NOW send queue (mainly filled by the UART task) and sends it, addressed or
+ * broadcast as db_espnow_event_destination() decides.
+ * Only call this function when nothing is in flight (db_espnow_tx_ready())! Otherwise order of packets is not
+ * guaranteed.
+ *
+ * A packet that is dequeued but cannot be put on air (oversized, encryption or esp_now_send() error) is lost - there
+ * is no requeue, as before - and is now counted as send_error. It consumes no sequence number, so the peer's loss
+ * counter never sees it; this counter is the only place it shows up.
  *
  * @return false if no packet was sent, true if packet was sent (actual sending will be confirmed by the send-callback)
  */
@@ -264,6 +302,14 @@ bool db_read_uart_queue_and_send() {
     static db_espnow_queue_event_t evt;
     // Receive data from Queue that was put there by other tasks to be sent via ESP-NOW
     if (db_espnow_send_queue != NULL && xQueueReceive(db_espnow_send_queue, &evt, 0) == pdTRUE) {
+        if (evt.data == NULL || evt.data_len > DB_ESPNOW_PAYLOAD_MAXSIZE) {
+            /* Every producer checks both already; this guards the fixed-size packet buffer
+             * below against a future producer that does not. */
+            ESP_LOGE(TAG, "Invalid send-queue element (len %u) - dropped", evt.data_len);
+            free(evt.data);
+            db_link_stats_inc(&db_link_stats.send_error);
+            return false;
+        }
         db_esp_now_packet_global.db_esp_now_packet_header.packet_type = evt.packet_type;
         if (DB_PARAM_RADIO_MODE == DB_WIFI_MODE_ESPNOW_GND) {
             db_esp_now_packet_global.db_esp_now_packet_header.origin = DB_ESPNOW_ORIGIN_GND;
@@ -275,16 +321,23 @@ bool db_read_uart_queue_and_send() {
         // ToDo: Potential to optimize: esp_now_send() does not need an instance of buffer after sending, however using evt.data as pointer resulted in errors
         memcpy(db_esp_now_packet_global.db_esp_now_packet_protected_data.payload, evt.data, evt.data_len);
         free(evt.data);
+        const uint8_t *dest = db_espnow_event_destination(&evt);
         // Encrypt, authenticate and send packet
-        if(db_espnow_encrypt_auth_send(&db_esp_now_packet_global, evt.data_len)) {
+        if(db_espnow_encrypt_auth_send(&db_esp_now_packet_global, evt.data_len, dest)) {
             // update sequence number for next packet
             if (db_esp_now_packet_global.db_esp_now_packet_header.seq_num < UINT32_MAX) {
                 db_esp_now_packet_global.db_esp_now_packet_header.seq_num++;    // packet is static so just increase number once we sent it
             } else {
                 db_esp_now_packet_global.db_esp_now_packet_header.seq_num = 0;  // catch overflow in case someone got crazy
             }
+            /* Counted here, beside the sequence-number increment, and nowhere else: that is
+             * what makes sent_broadcast + sent_addressed the exact population the peer's
+             * sequence-gap loss counter observes. */
+            db_espnow_tx_on_sent(&db_espnow_tx_tracker, dest != NULL,
+                                 (uint32_t) (esp_timer_get_time() / 1000), &db_link_stats);
             return true;
         } else {
+            db_link_stats_inc(&db_link_stats.send_error);
             return false;
         }
     } else {
@@ -448,7 +501,7 @@ static bool db_espnow_register_peer(const uint8_t peer_mac[ESP_NOW_ETH_ALEN]) {
  * Returns an address only when DB_PARAM_ESPNOW_UNICAST asks for one and exactly one peer
  * is known, so a default build broadcasts exactly as it always has.
  *
- * **Why exactly one peer.** The send path is single-flight - ready_to_send waits for the
+ * **Why exactly one peer.** The send path is single-flight - it waits for the
  * send callback so packet order is preserved - and one payload must therefore remain one
  * esp_now_send() call. With several AIR units a broadcast also reaches all of them in one
  * airtime slot where N unicasts cost N, on a link whose goodput the whole fleet shares.
@@ -462,15 +515,15 @@ static bool db_espnow_register_peer(const uint8_t peer_mac[ESP_NOW_ETH_ALEN]) {
  * @return pointer to the peer's MAC, or NULL if the packet should be broadcast
  */
 static const uint8_t *db_espnow_unicast_target(void) {
-    if (DB_PARAM_ESPNOW_UNICAST == DB_ESPNOW_UNICAST_OFF) {
-        return NULL;
-    }
-    const uint8_t *mac = NULL;
-    if (DB_PARAM_RADIO_MODE == DB_WIFI_MODE_ESPNOW_AIR) {
-        mac = db_espnow_gnd_mac_known ? db_espnow_gnd_mac : NULL;
-    } else if (db_esp_now_clients_list != NULL && db_esp_now_clients_list->size == 1) {
-        mac = db_esp_now_clients_list->db_esp_now_bpeer_info[0].broadcast_peer_mac;
-    }
+    /* The choice itself is db_espnow_auto_target_candidate() (host-tested); unchanged in
+     * substance from before it was moved there. */
+    const bool have_list = db_esp_now_clients_list != NULL;
+    const uint8_t *mac = db_espnow_auto_target_candidate(
+            DB_PARAM_ESPNOW_UNICAST != DB_ESPNOW_UNICAST_OFF,
+            DB_PARAM_RADIO_MODE == DB_WIFI_MODE_ESPNOW_AIR,
+            db_espnow_gnd_mac_known, db_espnow_gnd_mac,
+            have_list ? db_esp_now_clients_list->size : 0U,
+            have_list ? db_esp_now_clients_list->db_esp_now_bpeer_info[0].broadcast_peer_mac : NULL);
     /* Registration can have failed (peer table full, ESP-NOW not ready when the peer was
      * first seen); broadcast is the honest fallback. */
     if (mac == NULL || !esp_now_is_peer_exist(mac)) {
@@ -642,6 +695,13 @@ void db_espnow_process_rcv_data(uint8_t *data, uint16_t data_len, uint8_t *src_a
             db_espnow_uart_queue_event_t db_uart_evt = {0};
             db_uart_evt.data_len = db_decrypted_data[0];    // should be equal to len_payload-1 if everything worked out
             db_uart_evt.data = malloc(db_uart_evt.data_len);
+            if (db_uart_evt.data == NULL) {
+                /* Out of heap: drop this packet rather than memcpy into NULL and reset the
+                 * unit mid-flight. The link is lossy anyway; a reboot is not. */
+                db_link_stats_inc(&db_link_stats.drop_alloc_fail);
+                ESP_LOGE(TAG, "malloc(%u) failed - dropping received packet", db_uart_evt.data_len);
+                return;
+            }
             // For some reason it seems we cannot directly decrypt to db_espnow_uart_event_t -> Queues get set to NULL
             memcpy(db_uart_evt.data, &db_decrypted_data[1], db_uart_evt.data_len);
             memcpy(db_uart_evt.source_mac, src_addr, ESP_NOW_ETH_ALEN);
@@ -657,6 +717,7 @@ void db_espnow_process_rcv_data(uint8_t *data, uint16_t data_len, uint8_t *src_a
                            pdMS_TO_TICKS(DB_ESPNOW_DATA_QUEUE_DELAY_MS)) != pdTRUE) {
                 ESP_LOGW(TAG, "db_uart_write_queue full - dropping %u B downlink",
                          db_uart_evt.data_len);
+                db_link_stats_inc(&db_link_stats.drop_uart_queue_full);
                 free(db_uart_evt.data);
             } else {
                 // all good
@@ -693,43 +754,34 @@ void db_espnow_process_rcv_data(uint8_t *data, uint16_t data_len, uint8_t *src_a
 
 /**
  * ESP-NOW sending callback function is called in WiFi task.
- * Do not do lengthy operations from this task. Instead, post necessary data to a queue and handle it from the control
- * module task.
+ * Do not do lengthy operations from this task. Instead, post necessary data to a queue and handle it from the ESP-NOW
+ * task.
  * Note that too short interval between sending two ESP-NOW data may lead to disorder of sending callback function.
  * So, it is recommended that sending the next ESP-NOW data after the sending callback function of the previous sending
  * has returned.
+ *
+ * Posts to its own queue with a zero timeout: never blocks the WiFi task. If the post ever fails the ESP-NOW task's
+ * deadline (DB_ESPNOW_SEND_CB_TIMEOUT_MS) releases the send path and counts it, so a lost event costs at most that
+ * long instead of wedging transmission. A failed send is no longer logged here - logging from the WiFi task slows
+ * the radio - but by the ESP-NOW task, which also counts it.
  */
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
 static void db_espnow_send_callback(const esp_now_send_info_t *esp_now_send_info, esp_now_send_status_t status) {
-    if (status == ESP_NOW_SEND_FAIL) {
-        ESP_LOGE(TAG, "Failed to send ESP-NOW packet - MAC: %02xh:%02xh:%02xh:%02xh:%02xh:%02xh",
-                 esp_now_send_info->des_addr[0], esp_now_send_info->des_addr[1], esp_now_send_info->des_addr[2], esp_now_send_info->des_addr[3], esp_now_send_info->des_addr[4], esp_now_send_info->des_addr[5]);
+    if (esp_now_send_info == NULL || esp_now_send_info->des_addr == NULL) {
+        return;     // nothing to report; the send path deadline recovers
     }
+    const uint8_t *mac_addr = esp_now_send_info->des_addr;
 #else
 static void db_espnow_send_callback(const uint8_t *mac_addr, esp_now_send_status_t status) {
     if (mac_addr == NULL) {
-        ESP_LOGE(TAG, "Send callback arg error");
-        return;
-    }
-
-    if (status == ESP_NOW_SEND_FAIL) {
-        ESP_LOGE(TAG, "Failed to send ESP-NOW packet - MAC: %02xh:%02xh:%02xh:%02xh:%02xh:%02xh",
-                 mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
+        return;     // nothing to report; the send path deadline recovers
     }
 #endif
-
-    db_espnow_event_t evt;
-    db_espnow_event_send_cb_t *send_cb = &evt.info.send_cb;
-
-    evt.id = DB_ESPNOW_SEND_CB;
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
-    memcpy(send_cb->mac_addr, esp_now_send_info->des_addr, ESP_NOW_ETH_ALEN);
-#else
-    memcpy(send_cb->mac_addr, mac_addr, ESP_NOW_ETH_ALEN);
-#endif
-    send_cb->status = status;
-    if (xQueueSend(db_espnow_send_recv_callback_queue, &evt, ESPNOW_MAXDELAY) != pdTRUE) {
-        ESP_LOGW(TAG, "Send to send queue fail");
+    db_espnow_event_send_cb_t send_cb;
+    memcpy(send_cb.mac_addr, mac_addr, ESP_NOW_ETH_ALEN);
+    send_cb.status = status;
+    if (db_espnow_send_cb_queue != NULL) {
+        (void) xQueueSend(db_espnow_send_cb_queue, &send_cb, 0);
     }
 }
 
@@ -774,7 +826,7 @@ static void db_espnow_receive_callback(const esp_now_recv_info_t *recv_info, con
     memcpy(recv_cb->mac_addr, src_addr, ESP_NOW_ETH_ALEN);
     recv_cb->data = malloc(len);
     if (recv_cb->data == NULL) {
-        ESP_LOGE(TAG, "Malloc receive data fail");
+        db_link_stats_inc(&db_link_stats.drop_alloc_fail);
         return;
     }
     memcpy(recv_cb->data, data, len);
@@ -786,8 +838,13 @@ static void db_espnow_receive_callback(const esp_now_recv_info_t *recv_info, con
         recv_cb->noise_floor = recv_info->rx_ctrl->noise_floor;
     }
 #endif
-    if (db_espnow_send_recv_callback_queue != NULL && xQueueSend(db_espnow_send_recv_callback_queue, &evt, ESPNOW_MAXDELAY) != pdTRUE) {
-        ESP_LOGW(TAG, "Send to receive queue fail");
+    /* Zero timeout: this is the WiFi driver's task. Waiting here (it used to be up to 512 ms)
+     * stalls every other receive and every send completion on the unit, i.e. turns one full
+     * queue into a radio-wide outage. A packet that does not fit is dropped and counted. No
+     * log line either - at a high drop rate the logging itself would slow the WiFi task. */
+    if (db_espnow_send_recv_callback_queue == NULL ||
+        xQueueSend(db_espnow_send_recv_callback_queue, &evt, 0) != pdTRUE) {
+        db_link_stats_inc(&db_link_stats.drop_rx_queue_full);
         free(recv_cb->data);
     }
 }
@@ -834,6 +891,7 @@ void deinit_espnow_all(){
     ESP_LOGW(TAG, "De init ESPNOW incl. Queues & AES");
     mbedtls_gcm_free(&aes);
     vSemaphoreDelete(db_espnow_send_recv_callback_queue);
+    vSemaphoreDelete(db_espnow_send_cb_queue);
     vSemaphoreDelete(db_espnow_send_queue); // ToDo: Check if that is a good idea since control task might be using it
     vSemaphoreDelete(db_uart_write_queue); // ToDo: Check if that is a good idea since control task might be using it
     db_espnow_broadcast_peers_list_destroy(db_esp_now_clients_list);
@@ -853,6 +911,12 @@ esp_err_t db_espnow_init() {
         ESP_LOGE(TAG, "Create db_espnow_send_recv_callback_queue mutex fail");
         return ESP_FAIL;
     }
+    db_espnow_send_cb_queue = xQueueCreate(DB_ESPNOW_SEND_CB_QUEUE_SIZE, sizeof(db_espnow_event_send_cb_t));
+    if (db_espnow_send_cb_queue == NULL) {
+        ESP_LOGE(TAG, "Create db_espnow_send_cb_queue fail");
+        return ESP_FAIL;
+    }
+    db_espnow_tx_tracker_init(&db_espnow_tx_tracker);
 
     /* Init Queues for communication with control task */
     db_espnow_send_queue = xQueueCreate(ESPNOW_QUEUE_SIZE, sizeof(db_espnow_queue_event_t));
@@ -917,6 +981,12 @@ esp_err_t db_espnow_init() {
 /**
  * Send ESP-NOW DroneBridge for ESP32 internal telemetry packet containing RSSI and noise floor info from GND to AIR.
  * Used by AIR side to create a RADIO_STATUS MAVLink message sent to GCS.
+ *
+ * Runs in the ESP-NOW task, which is the only task that drains db_espnow_send_queue - so it must never wait for a
+ * slot there (it would be waiting for itself). Zero timeout; the caller's free-slot gate makes a full queue
+ * practically impossible, and a refusal just leaves the frame pending for the next send callback.
+ * Routed DB_ESPNOW_DEST_AUTO, i.e. exactly as before this field existed.
+ *
  * @return true when packet was scheduled for sending, false if it will not be sent
  */
 bool db_espnow_schedule_internal_telemetry_packet() {
@@ -936,13 +1006,19 @@ bool db_espnow_schedule_internal_telemetry_packet() {
     ESP_LOGD(TAG, "Scheduling int. telem. packet");
     uint8_t payload_size = sizeof(db_esp_now_clients_list_t);
 
-    db_espnow_queue_event_t evt;
+    db_espnow_queue_event_t evt = {0};
     // Set payload of DroneBridge for ESP32 ESP-NOW packet
     evt.data = malloc(payload_size);
+    if (evt.data == NULL) {
+        db_link_stats_inc(&db_link_stats.drop_alloc_fail);
+        ESP_LOGE(TAG, "malloc(%u) failed - peer-list frame postponed", payload_size);
+        return false;
+    }
     memcpy(evt.data, db_esp_now_clients_list, payload_size);
     evt.data_len = payload_size;
     evt.packet_type = DB_ESP_NOW_PACKET_TYPE_INTERNAL_TELEMETRY;
-    if (xQueueSend(db_espnow_send_queue, &evt, ESPNOW_MAXDELAY) != pdTRUE) {
+    evt.dest_mode = DB_ESPNOW_DEST_AUTO;
+    if (xQueueSend(db_espnow_send_queue, &evt, 0) != pdTRUE) {
         ESP_LOGW(TAG, "Send to db_espnow_send_queue queue fail");
         free(evt.data);
         return false;
@@ -965,8 +1041,9 @@ _Noreturn void process_espnow_data() {
         vTaskDelete(NULL);
     }
     db_espnow_event_t evt;
-    // indicator that the last ESP-NOW send callback returned -> we can send the next packet
-    bool ready_to_send = true; // initially true
+    db_espnow_event_send_cb_t send_cb_evt;
+    /* Whether the next packet may go to the radio now lives in db_espnow_tx_tracker (initialised by db_espnow_init):
+     * same single-flight rule as the old ready_to_send flag, plus a deadline so a lost callback cannot wedge it. */
     bool send_internal_telemetry_frame = false;    // flag that indicates a new internal telemetry frame shall be sent
     int delay_timer_cnt = 0;
     /* Starts in the past so the first peer-list frame goes out immediately rather than
@@ -974,30 +1051,42 @@ _Noreturn void process_espnow_data() {
      * arrives. */
     int64_t last_internal_telemetry_us = -(int64_t) DB_ESPNOW_INTERNAL_TELEMETRY_PERIOD_US;
     while(1) {
+        /* Send-callback results first: they are what releases the send path. */
+        if (db_espnow_send_cb_queue != NULL && xQueueReceive(db_espnow_send_cb_queue, &send_cb_evt, 0) == pdTRUE) {
+            const bool success = send_cb_evt.status == ESP_NOW_SEND_SUCCESS;
+            if (!success) {
+                ESP_LOGW(TAG, "ESP-NOW send failed - MAC: " MACSTR, MAC2STR(send_cb_evt.mac_addr));
+            }
+            // the last sending callback has returned, so we keep the order of packets. ESP-NOW by default does not
+            // guarantee the order when many packets are sent in quick succession. A late callback (its packet was
+            // already written off by the deadline below) releases nothing.
+            if (db_espnow_tx_on_send_cb(&db_espnow_tx_tracker, success, &db_link_stats)) {
+                /* Housekeeping only takes a queue slot while there are slots to
+                 * spare. The peer-list frame shares db_espnow_send_queue with the
+                 * GCS's uplink in FIFO order, so it cannot jump ahead of user data -
+                 * but at 211 B it can crowd the queue out by sheer volume, and a full
+                 * queue is what stalls the control task. Under pressure, drain user
+                 * data instead and let the RSSI display arrive late. */
+                if (DB_PARAM_RADIO_MODE == DB_WIFI_MODE_ESPNOW_GND && send_internal_telemetry_frame &&
+                    db_espnow_send_queue != NULL &&
+                    uxQueueSpacesAvailable(db_espnow_send_queue) > (ESPNOW_QUEUE_SIZE / 2)) {
+                    send_internal_telemetry_frame = !db_espnow_schedule_internal_telemetry_packet();
+                } else {
+                    // try to immediately send the next packet if available (marks it in flight if sent)
+                    (void) db_read_uart_queue_and_send();
+                }
+            }
+        }
+        /* The deadline: a send callback that never arrives (event lost, or a driver that never reports) must not stop
+         * transmission for good. The packet is written off - its fate is unknown, so it is counted neither as
+         * delivered nor as failed - and sending resumes. */
+        if (db_espnow_tx_check_timeout(&db_espnow_tx_tracker, (uint32_t) (esp_timer_get_time() / 1000),
+                                       DB_ESPNOW_SEND_CB_TIMEOUT_MS, &db_link_stats)) {
+            ESP_LOGW(TAG, "No ESP-NOW send callback within %d ms - resuming the send path", DB_ESPNOW_SEND_CB_TIMEOUT_MS);
+        }
         if (db_espnow_send_recv_callback_queue == NULL) ESP_LOGE(TAG, "db_espnow_send_recv_callback_queue is NULL!");
         if(db_espnow_send_recv_callback_queue != NULL && xQueueReceive(db_espnow_send_recv_callback_queue, &evt, 0) == pdTRUE) {
             switch (evt.id) {
-                case DB_ESPNOW_SEND_CB: {
-                    // db_espnow_event_send_cb_t *send_cb = &evt.info.send_cb;  // no needed for now
-                    // indicate that we can send next packet - the last sending callback has returned, so we keep the order
-                    // of packets. ESP-NOW by default does not guarantee the order when many packets are sent in quick succession
-                    ready_to_send = true;
-                    /* Housekeeping only takes a queue slot while there are slots to
-                     * spare. The peer-list frame shares db_espnow_send_queue with the
-                     * GCS's uplink in FIFO order, so it cannot jump ahead of user data -
-                     * but at 211 B it can crowd the queue out by sheer volume, and a full
-                     * queue is what stalls the control task. Under pressure, drain user
-                     * data instead and let the RSSI display arrive late. */
-                    if (DB_PARAM_RADIO_MODE == DB_WIFI_MODE_ESPNOW_GND && send_internal_telemetry_frame &&
-                        db_espnow_send_queue != NULL &&
-                        uxQueueSpacesAvailable(db_espnow_send_queue) > (ESPNOW_QUEUE_SIZE / 2)) {
-                        send_internal_telemetry_frame = !db_espnow_schedule_internal_telemetry_packet();
-                    } else {
-                        // try to immediately send the next packet if available and set ready_to_send accordingly
-                        ready_to_send = !db_read_uart_queue_and_send();
-                    }
-                    break;
-                }
                 case DB_ESPNOW_RECV_CB: {
                     db_espnow_event_recv_cb_t *recv_cb = &evt.info.recv_cb;
                     db_espnow_process_rcv_data(recv_cb->data, recv_cb->data_len, recv_cb->mac_addr, recv_cb->rssi,
@@ -1011,9 +1100,9 @@ _Noreturn void process_espnow_data() {
             }
         }
         /* process UART -> ESP-NOW */
-        if (ready_to_send) {
-            // send the next packet if available and set ready_to_send accordingly
-            ready_to_send = !db_read_uart_queue_and_send();
+        if (db_espnow_tx_ready(&db_espnow_tx_tracker)) {
+            // send the next packet if available (marks it in flight if sent)
+            (void) db_read_uart_queue_and_send();
         } else {
             // do nothing - we are not ready for sending another packet
         }

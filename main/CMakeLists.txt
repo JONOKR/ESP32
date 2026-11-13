@@ -7,6 +7,8 @@ set(SRCS
         db_crc.c
         db_esp_now.c
         db_espnow_mavlink_parser.c
+        db_espnow_link_stats.c
+        db_espnow_tx_path.c
         db_espnow_binding.c
         db_serial.c
         db_mavlink_msgs.c

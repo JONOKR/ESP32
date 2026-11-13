@@ -24,6 +24,7 @@
 #include <stdint.h>
 #include <esp_now.h>
 #include "db_espnow_limits.h"   // DB_ESPNOW_MAX_BROADCAST_PEERS (19), upstream since v2.4.0
+#include "db_espnow_tx_path.h"  // db_espnow_dest_mode_t
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 
@@ -34,12 +35,35 @@
 // payload each. Kept through the v2.4.1 merge on purpose - this link has no
 // retransmission, so an overflow is an unrecoverable loss (memory.md 5.0).
 #define ESPNOW_QUEUE_SIZE   12
-// Blocking budget when enqueueing, in FreeRTOS ticks. CONFIG_FREERTOS_HZ is 1000,
-// so 512 ticks is **512 ms** - which is where this used to be for every queue.
-// Still correct for db_espnow_send_recv_callback_queue: dropping a SEND_CB event
-// would leave ready_to_send false forever and wedge the send path permanently, so
-// that queue must block rather than lose an event.
-#define ESPNOW_MAXDELAY     512
+// ESPNOW_MAXDELAY (512 ticks = 512 ms) used to be the enqueue budget of both WiFi-driver
+// callbacks. It is gone from the radio path: those callbacks run in the WiFi driver's own
+// task, and blocking it for half a second stalls every receive and every transmit
+// completion on the unit. It was kept that long only because a lost send-callback event
+// left `ready_to_send` false forever and wedged transmission (memory.md 5.4). That
+// fragility is now removed at its root instead, two ways:
+//  - send-callback events have their own queue (DB_ESPNOW_SEND_CB_QUEUE_SIZE), so a burst
+//    of received packets can no longer crowd out the one event the send path waits on;
+//  - the in-flight packet has a deadline (DB_ESPNOW_SEND_CB_TIMEOUT_MS), so even a lost
+//    event delays transmission by a bounded time and is counted (send_cb_timeout).
+// Both callbacks therefore enqueue with a zero timeout: a received packet that does not
+// fit is dropped and counted (drop_rx_queue_full).
+//
+// Depth of the send-callback event queue. The send path is single-flight, so at most one
+// callback is normally outstanding; a late callback after a timeout recovery makes two.
+// 4 leaves headroom so this queue can never be the reason an event is lost.
+#define DB_ESPNOW_SEND_CB_QUEUE_SIZE 4
+// Deadline for a send callback after esp_now_send() accepted a packet. Espressif do not
+// document the unicast retry count (esp_now.rst only says SEND_SUCCESS means "received
+// successfully on the MAC layer"); the decision doc's "~7 retries" is the IEEE 802.11
+// default short retry limit, assumed rather than verified. Worst case per attempt at the
+// slowest rate this firmware uses, LR 250 kbps: a full 250 B ESP-NOW frame plus ~45 B of
+// 802.11 action-frame overhead is ~2360 bits = ~9.4 ms, plus the ACK and LR preambles
+// (~2-3 ms), plus a maximal 802.11b backoff of 1023 slots x 20 us = ~20.5 ms, i.e. ~33 ms;
+// 8 attempts = ~270 ms. 500 ms clears that with margin, so a slow-but-real callback is
+// never written off, and equals the old blocking budget, so the worst case introduces no
+// stall class that did not already exist. In normal operation the deadline is never hit:
+// it exists for the event that is lost, and send_cb_timeout makes any hit visible.
+#define DB_ESPNOW_SEND_CB_TIMEOUT_MS 500
 // ...but the two *data-path* queues must DROP instead of block. Measured
 // 2026-11-12 (memory.md 5.4): with the radio at an LR rate the 12-slot send queue
 // stays full, and a 512 ms xQueueSend inside read_process_serial_link stalled the
@@ -136,11 +160,13 @@ typedef enum {
     DB_ESP_NOW_PACKET_TYPE_INTERNAL_TELEMETRY = 1,
 } db_espnow_queue_event_type_t;
 
-/* Element of db_espnow_send_queue. */
+/* Element of db_espnow_send_queue. Internal to one unit - none of this goes on air. */
 typedef struct {
     uint8_t data_len;
     uint8_t *data;
     db_espnow_queue_event_type_t packet_type;   // only relevant when reading queue that sends via ESP-NOW
+    uint8_t dest_mode;                          // db_espnow_dest_mode_t; DB_ESPNOW_DEST_AUTO = today's routing
+    uint8_t dest_mac[ESP_NOW_ETH_ALEN];         // only read when dest_mode == DB_ESPNOW_DEST_PEER
 } __attribute__((__packed__)) db_espnow_queue_event_t;
 
 /** Element of db_uart_write_queue, including the source stream identity. */

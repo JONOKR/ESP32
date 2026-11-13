@@ -307,6 +307,11 @@ void db_parse_mavlink_from_radio(int *tcp_clients, udp_conn_list_t *udp_conns, u
                         }
                     } else if (db_tunnel_type == DB_ESPNOW_TUNNEL_FLEET_LIST) {
                         db_control_frame = true; // GND->GCS only; never hand it to an FC
+                    } else if (db_tunnel_type == DB_ESPNOW_TUNNEL_LINK_STATS) {
+                        /* Another unit's link-stats report. The GND must pass it through to the GCS
+                         * (that is its only way there); an AIR unit only hears it as a neighbour's
+                         * broadcast and must not hand it to its flight controller. */
+                        db_control_frame = DB_PARAM_RADIO_MODE != DB_WIFI_MODE_ESPNOW_GND;
                     }
                 }
             }
