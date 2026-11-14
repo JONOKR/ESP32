@@ -22,9 +22,20 @@
  * aircraft or the operator does - and how one such frame is routed in ESPNOW_UNICAST mode 1.
  *
  * Specification: docs/decisions/2026-11-10-link-reliability-architecture.md, Layer 2 and
- * implementation Steps 4 and 5. The allowlists below are that document's lists, verbatim; an
- * addition costs an airtime slot the whole fleet shares, so the bar for joining is "does losing
- * exactly one of these change behaviour?".
+ * implementation Steps 4 and 5. The allowlists below are that document's lists plus two
+ * additions; an addition costs an airtime slot the whole fleet shares, so the bar for joining is
+ * "does losing exactly one of these change behaviour?".
+ *
+ * ADDITIONS BEYOND THE DECISION DOC (2026-11-14), so the divergence stays visible here until the
+ * document is amended:
+ *  - MISSION_REQUEST (40), AIR->GND. In the 2026-11-12 mission-upload traces this ArduCopter
+ *    answered MISSION_COUNT with MISSION_REQUEST - 25 per upload - and never with
+ *    MISSION_REQUEST_INT (51), the only item request the doc lists. Without it, every item
+ *    request of a mission upload would still travel by broadcast in mode 1.
+ *  - MISSION_REQUEST_LIST (43), GND->AIR. The GCS sends it to pull or verify a mission
+ *    (GroundControl mission_upload.py, _send_mission_request_list); it starts that handshake and
+ *    the doc's list omitted it.
+ * MISSION_ITEM (39) is deliberately NOT added: nothing in this system sends it.
  *
  * Pure C, free of ESP-IDF and fastmavlink, so the host tests can pin every list entry. The
  * caller (db_serial.c) does the MAVLink parsing and hands over the message id and, for TUNNEL,
@@ -55,7 +66,9 @@
 #define DB_MAVLINK_MSG_ID_SCALED_IMU           26U
 #define DB_MAVLINK_MSG_ID_ATTITUDE             30U
 #define DB_MAVLINK_MSG_ID_GLOBAL_POSITION_INT  33U
+#define DB_MAVLINK_MSG_ID_MISSION_REQUEST      40U
 #define DB_MAVLINK_MSG_ID_MISSION_SET_CURRENT  41U
+#define DB_MAVLINK_MSG_ID_MISSION_REQUEST_LIST 43U
 #define DB_MAVLINK_MSG_ID_MISSION_COUNT        44U
 #define DB_MAVLINK_MSG_ID_MISSION_CLEAR_ALL    45U
 #define DB_MAVLINK_MSG_ID_MISSION_ACK          47U
@@ -118,9 +131,11 @@ typedef struct {
  *
  * GND->AIR: COMMAND_LONG, COMMAND_INT, MISSION_COUNT, MISSION_ITEM_INT, MISSION_REQUEST_INT,
  * MISSION_ACK, MISSION_CLEAR_ALL, MISSION_SET_CURRENT, PARAM_SET, PARAM_REQUEST_READ, SET_MODE,
- * and TUNNEL carrying DB_ESPNOW_TUNNEL_ADDRESSED_DATA.
+ * TUNNEL carrying DB_ESPNOW_TUNNEL_ADDRESSED_DATA, and MISSION_REQUEST_LIST (added 2026-11-14,
+ * beyond the doc - see the top of this file).
  * AIR->GND: COMMAND_ACK, MISSION_ACK, MISSION_REQUEST_INT, MISSION_ITEM_INT, MISSION_COUNT,
- * PARAM_VALUE, STATUSTEXT.
+ * PARAM_VALUE, STATUSTEXT, and MISSION_REQUEST (added 2026-11-14, beyond the doc - see the top
+ * of this file).
  * Everything else is telemetry - explicitly HEARTBEAT, RADIO_STATUS (the instrument, Trap 9),
  * every other TUNNEL including FLEET_LIST and the 0xDB03 link-stats report, and every id this
  * firmware does not know.

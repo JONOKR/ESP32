@@ -67,6 +67,8 @@ bool db_espnow_frame_is_control(const db_espnow_link_dir_t dir, const uint32_t m
             case DB_MAVLINK_MSG_ID_PARAM_SET:
             case DB_MAVLINK_MSG_ID_PARAM_REQUEST_READ:
             case DB_MAVLINK_MSG_ID_SET_MODE:
+            /* Beyond the decision doc (2026-11-14): starts the GCS's mission pull/verify. */
+            case DB_MAVLINK_MSG_ID_MISSION_REQUEST_LIST:
                 return true;
             case DB_MAVLINK_MSG_ID_TUNNEL:
                 /* Only the addressed wrapper. FLEET_LIST is GND->GCS over serial and the link-stats
@@ -85,6 +87,9 @@ bool db_espnow_frame_is_control(const db_espnow_link_dir_t dir, const uint32_t m
             case DB_MAVLINK_MSG_ID_MISSION_COUNT:
             case DB_MAVLINK_MSG_ID_PARAM_VALUE:
             case DB_MAVLINK_MSG_ID_STATUSTEXT:
+            /* Beyond the decision doc (2026-11-14): the item request this ArduCopter actually
+             * sends during an upload - never MISSION_REQUEST_INT in the 2026-11-12 traces. */
+            case DB_MAVLINK_MSG_ID_MISSION_REQUEST:
                 return true;
             default:
                 return false;

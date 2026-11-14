@@ -50,6 +50,7 @@ static const uint32_t UPLINK_CONTROL[] = {
         FASTMAVLINK_MSG_ID_MISSION_ITEM_INT, FASTMAVLINK_MSG_ID_MISSION_REQUEST_INT, FASTMAVLINK_MSG_ID_MISSION_ACK,
         FASTMAVLINK_MSG_ID_MISSION_CLEAR_ALL, FASTMAVLINK_MSG_ID_MISSION_SET_CURRENT, FASTMAVLINK_MSG_ID_PARAM_SET,
         FASTMAVLINK_MSG_ID_PARAM_REQUEST_READ, FASTMAVLINK_MSG_ID_SET_MODE,
+        FASTMAVLINK_MSG_ID_MISSION_REQUEST_LIST,    // beyond the doc, 2026-11-14
 };
 
 /** AIR->GND allowlist, verbatim from the decision doc. */
@@ -57,6 +58,7 @@ static const uint32_t DOWNLINK_CONTROL[] = {
         FASTMAVLINK_MSG_ID_COMMAND_ACK, FASTMAVLINK_MSG_ID_MISSION_ACK, FASTMAVLINK_MSG_ID_MISSION_REQUEST_INT,
         FASTMAVLINK_MSG_ID_MISSION_ITEM_INT, FASTMAVLINK_MSG_ID_MISSION_COUNT, FASTMAVLINK_MSG_ID_PARAM_VALUE,
         FASTMAVLINK_MSG_ID_STATUSTEXT,
+        FASTMAVLINK_MSG_ID_MISSION_REQUEST,         // beyond the doc, 2026-11-14
 };
 
 /** "Explicitly not on the list", plus frames that must never be mistaken for control. */
@@ -99,7 +101,9 @@ static void test_constants_match_fastmavlink(void) {
     assert(DB_MAVLINK_MSG_ID_SCALED_IMU == FASTMAVLINK_MSG_ID_SCALED_IMU);
     assert(DB_MAVLINK_MSG_ID_ATTITUDE == FASTMAVLINK_MSG_ID_ATTITUDE);
     assert(DB_MAVLINK_MSG_ID_GLOBAL_POSITION_INT == FASTMAVLINK_MSG_ID_GLOBAL_POSITION_INT);
+    assert(DB_MAVLINK_MSG_ID_MISSION_REQUEST == FASTMAVLINK_MSG_ID_MISSION_REQUEST);
     assert(DB_MAVLINK_MSG_ID_MISSION_SET_CURRENT == FASTMAVLINK_MSG_ID_MISSION_SET_CURRENT);
+    assert(DB_MAVLINK_MSG_ID_MISSION_REQUEST_LIST == FASTMAVLINK_MSG_ID_MISSION_REQUEST_LIST);
     assert(DB_MAVLINK_MSG_ID_MISSION_COUNT == FASTMAVLINK_MSG_ID_MISSION_COUNT);
     assert(DB_MAVLINK_MSG_ID_MISSION_CLEAR_ALL == FASTMAVLINK_MSG_ID_MISSION_CLEAR_ALL);
     assert(DB_MAVLINK_MSG_ID_MISSION_ACK == FASTMAVLINK_MSG_ID_MISSION_ACK);
@@ -140,6 +144,15 @@ static void test_allowlists(void) {
     assert(!db_espnow_frame_is_control(DB_ESPNOW_LINK_GND_TO_AIR, FASTMAVLINK_MSG_ID_COMMAND_ACK, 0));
     assert(!db_espnow_frame_is_control(DB_ESPNOW_LINK_AIR_TO_GND, FASTMAVLINK_MSG_ID_COMMAND_LONG, 0));
     assert(!db_espnow_frame_is_control(DB_ESPNOW_LINK_AIR_TO_GND, FASTMAVLINK_MSG_ID_SET_MODE, 0));
+
+    // the 2026-11-14 additions: control in their own direction, telemetry in the other
+    assert(db_espnow_frame_is_control(DB_ESPNOW_LINK_AIR_TO_GND, FASTMAVLINK_MSG_ID_MISSION_REQUEST, 0));
+    assert(!db_espnow_frame_is_control(DB_ESPNOW_LINK_GND_TO_AIR, FASTMAVLINK_MSG_ID_MISSION_REQUEST, 0));
+    assert(db_espnow_frame_is_control(DB_ESPNOW_LINK_GND_TO_AIR, FASTMAVLINK_MSG_ID_MISSION_REQUEST_LIST, 0));
+    assert(!db_espnow_frame_is_control(DB_ESPNOW_LINK_AIR_TO_GND, FASTMAVLINK_MSG_ID_MISSION_REQUEST_LIST, 0));
+    // and nothing else was added with them: MISSION_ITEM (39) stays telemetry both ways
+    assert(!db_espnow_frame_is_control(DB_ESPNOW_LINK_GND_TO_AIR, FASTMAVLINK_MSG_ID_MISSION_ITEM, 0));
+    assert(!db_espnow_frame_is_control(DB_ESPNOW_LINK_AIR_TO_GND, FASTMAVLINK_MSG_ID_MISSION_ITEM, 0));
 
     for (size_t i = 0; i < sizeof(TELEMETRY) / sizeof(TELEMETRY[0]); i++) {
         assert(!db_espnow_frame_is_control(DB_ESPNOW_LINK_GND_TO_AIR, TELEMETRY[i], 0));
