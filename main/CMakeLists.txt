@@ -36,9 +36,15 @@ if(DEFINED DB_ROLE)
     # the external antenna. Channel is explicit (not just relying on the
     # stock default) so all three roles are guaranteed to agree even if the
     # stock default ever changes upstream.
+    # Addressed control frames (ESPNOW_UNICAST=1) are the JONOKR default: measured
+    # 2026-11-14 to remove the GCS's one-second protocol timeouts, which is the failure
+    # that cost a flight on 2026-11-01 (memory.md 5.7). It is baked for ALL THREE roles
+    # because mode 1 needs both ends on it - a mixed fleet gets a meaningless uplink-loss
+    # counter on the older unit. The no-role fallback stays mode 0 (db_parameters.h).
     target_compile_definitions(${COMPONENT_LIB} PRIVATE
             "DB_BUILD_DEFAULT_CHANNEL=6"
-            "DB_BUILD_DEFAULT_EN_EXT_ANT=true")
+            "DB_BUILD_DEFAULT_EN_EXT_ANT=true"
+            "DB_BUILD_DEFAULT_UNICAST=DB_ESPNOW_UNICAST_CONTROL")
     # Antenna switch, by board. These are Seeed XIAO units built against the
     # generic board profile, so the Kconfig RF-switch path never compiles in and
     # ant_use_ext would drive nothing (see db_configure_antenna). Only the XIAO

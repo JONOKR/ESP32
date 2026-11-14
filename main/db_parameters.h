@@ -122,8 +122,21 @@ typedef bool (*db_param_output_callback_t)(const uint8_t *line, size_t line_leng
  *
  * 802.11 never acknowledges a group-addressed frame, so a broadcast ESP-NOW
  * packet is sent once and a lost one is gone. An addressed frame gets a MAC-layer
- * ACK and automatic hardware retries. Mode 0 is the default because this is the
- * link that carries flight commands and the change must be opt-in.
+ * ACK and automatic hardware retries.
+ *
+ * **The JONOKR role images default to mode 1** (DB_BUILD_DEFAULT_UNICAST below); a build
+ * with no -D DB_ROLE keeps mode 0, i.e. stock DroneBridge behaviour. Measured 2026-11-14
+ * at -77 to -81 dBm (memory.md 5.7): what mode 1 removes is not frame loss - telemetry
+ * stays broadcast - but the GCS's one-second protocol timeouts. In mode 0 a lost mission
+ * item is only noticed when a retry timer expires (4-8 items per upload took 1.1-3.1 s);
+ * in mode 1 the MAC retries repair it in milliseconds and no item exceeded 70 ms. The
+ * command round trip to the flight controller went from 4 impaired samples in 40, worst
+ * case 2.3 s, to none in 80, worst case 183 ms.
+ *
+ * **Mode 1 requires both ends on ESP32 4f60b57 or newer.** An older AIR still receives
+ * everything but its RADIO_STATUS.fixed uplink-loss count becomes meaningless, and a unit
+ * older than 58e78a0 discards addressed frames outright. Mode 0 interoperates with any
+ * firmware, which is why it stays the no-role default.
  */
 #define DB_PARAM_ESPNOW_UNICAST db_param_espnow_unicast.value.db_param_u8.value
 
@@ -208,6 +221,13 @@ enum E_DB_SERIAL_PROTOCOL {
 #endif
 #ifndef DB_BUILD_DEFAULT_EN_EXT_ANT
 #define DB_BUILD_DEFAULT_EN_EXT_ANT false
+#endif
+/* ESP-NOW addressing mode a freshly-erased unit boots with. The role images set this to
+ * DB_ESPNOW_UNICAST_CONTROL; the fallback is OFF so a build without -D DB_ROLE behaves
+ * exactly like stock DroneBridge. See DB_PARAM_ESPNOW_UNICAST above for the evidence and
+ * for the firmware-version requirement this carries. */
+#ifndef DB_BUILD_DEFAULT_UNICAST
+#define DB_BUILD_DEFAULT_UNICAST DB_ESPNOW_UNICAST_OFF
 #endif
 
 typedef struct db_parameter_str_s {

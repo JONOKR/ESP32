@@ -458,11 +458,15 @@ db_parameter_t db_param_espnow_air2air = {
 };
 
 /**
- * ESP-NOW addressing mode: 0 broadcast everything, 1 control frames addressed and everything else broadcast
- * (implemented - the mode meant for flying once it is verified), 2 all addressed (diagnostic only).
+ * ESP-NOW addressing mode: 0 broadcast everything, 1 control frames addressed and everything else broadcast,
+ * 2 all addressed (diagnostic only).
  *
- * Defaults to 0, which is byte-for-byte the behaviour this firmware has always had.
- * See db_parameters.h for what the modes mean and why the default is off.
+ * Defaults to DB_BUILD_DEFAULT_UNICAST: mode 1 in the JONOKR role images, mode 0 (the behaviour this
+ * firmware has always had) in a build with no -D DB_ROLE. See db_parameters.h for what the modes mean, the
+ * measurements behind the default and the firmware-version requirement mode 1 carries.
+ *
+ * The baked value only applies to a unit whose NVS is clean. A unit that already has a stored value keeps it,
+ * so switching an in-service unit over is a parameter write, not a reflash.
  */
 db_parameter_t db_param_espnow_unicast = {
         .db_name = "espnow_unicast",
@@ -474,8 +478,8 @@ db_parameter_t db_param_espnow_unicast = {
         },
         .value = {
                 .db_param_u8 = {
-                        .value = DB_ESPNOW_UNICAST_OFF,
-                        .default_value = DB_ESPNOW_UNICAST_OFF,
+                        .value = DB_BUILD_DEFAULT_UNICAST,
+                        .default_value = DB_BUILD_DEFAULT_UNICAST,
                         .min = DB_ESPNOW_UNICAST_OFF,
                         .max = DB_ESPNOW_UNICAST_ALL,
                 }
